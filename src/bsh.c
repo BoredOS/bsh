@@ -308,12 +308,37 @@ static void split_path(const char *path_str) {
 }
 
 static void load_shell_colors(void) {
-    g_color_dir = (uint32_t)sys_get_shell_config("dir_color");
-    g_color_file = (uint32_t)sys_get_shell_config("file_color");
-    g_color_size = (uint32_t)sys_get_shell_config("size_color");
-    g_color_error = (uint32_t)sys_get_shell_config("error_color");
-    g_color_success = (uint32_t)sys_get_shell_config("success_color");
-    g_color_default = (uint32_t)sys_get_shell_config("default_text_color");
+    g_color_dir = 0;
+    g_color_file = 0;
+    g_color_size = 0;
+    g_color_error = 0;
+    g_color_success = 0;
+    g_color_default = 0;
+
+    const char *env_dir = getenv("dir_color");
+    if (env_dir) {
+        parse_hex_color(env_dir, (int)strlen(env_dir), &g_color_dir);
+    }
+    const char *env_file = getenv("file_color");
+    if (env_file) {
+        parse_hex_color(env_file, (int)strlen(env_file), &g_color_file);
+    }
+    const char *env_size = getenv("size_color");
+    if (env_size) {
+        parse_hex_color(env_size, (int)strlen(env_size), &g_color_size);
+    }
+    const char *env_err = getenv("error_color");
+    if (env_err) {
+        parse_hex_color(env_err, (int)strlen(env_err), &g_color_error);
+    }
+    const char *env_succ = getenv("success_color");
+    if (env_succ) {
+        parse_hex_color(env_succ, (int)strlen(env_succ), &g_color_success);
+    }
+    const char *env_def = getenv("default_text_color");
+    if (env_def) {
+        parse_hex_color(env_def, (int)strlen(env_def), &g_color_default);
+    }
 
     if (g_color_default == 0) g_color_default = 0xFFCCCCCC;
     if (g_color_error == 0) g_color_error = 0xFFFF4444;
