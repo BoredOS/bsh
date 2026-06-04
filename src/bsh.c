@@ -755,10 +755,44 @@ static void build_path_candidate(char *out, int out_len, const char *dir, int di
     out[pos] = 0;
 }
 
+static bool read_shebang(const char *path, char *interp, int interp_max, char *arg, int arg_max) {
+    int fd = sys_open(path, "r");
+    if (fd < 0) return false;
+    char line[256];
+    int n = sys_read(fd, line, sizeof(line) - 1);
+    sys_close(fd);
+    if (n <= 0) return false;
+    line[n] = 0;
+    if (line[0] != '#' || line[1] != '!') return false;
+
+    char *end = strchr(line, '\n');
+    if (end) *end = 0;
+    end = strchr(line, '\r');
+    if (end) *end = 0;
+
+    char *p = line + 2;
+    while (*p == ' ' || *p == '\t') p++;
+
+    char *interp_start = p;
+    while (*p && *p != ' ' && *p != '\t') p++;
+
+    int interp_len = p - interp_start;
+    if (interp_len >= interp_max) interp_len = interp_max - 1;
+    memcpy(interp, interp_start, interp_len);
+    interp[interp_len] = 0;
+
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p) {
+        str_copy(arg, p, arg_max);
+    } else {
+        arg[0] = 0;
+    }
+    return true;
+}
+
 static int accept_command_candidate(const char *candidate) {
     if (access(candidate, X_OK) != 0) return -1;
     if (!is_file_path(candidate)) return -2;
-    if (!is_elf_file(candidate)) return -3;
 
     str_copy(g_resolved_command_path, candidate, sizeof(g_resolved_command_path));
     return 0;
@@ -1879,6 +1913,38 @@ static int execute_argv_inner(int argc, char *argv[], int depth, bool isolated, 
         return 1;
     }
 
+    if (!is_elf_file(full_path)) {
+        char interp[256] = {0};
+        char shebang_arg[256] = {0};
+        char *new_argv[MAX_ARGS];
+        int new_argc = 0;
+
+        if (read_shebang(full_path, interp, sizeof(interp), shebang_arg, sizeof(shebang_arg))) {
+            new_argv[new_argc++] = interp;
+            if (shebang_arg[0]) {
+                new_argv[new_argc++] = shebang_arg;
+            }
+            new_argv[new_argc++] = full_path;
+            for (int i = 1; i < argc; i++) {
+                if (new_argc < MAX_ARGS - 1) {
+                    new_argv[new_argc++] = argv[i];
+                }
+            }
+            new_argv[new_argc] = NULL;
+            return execute_argv_inner(new_argc, new_argv, depth + 1, isolated, background, want_exit, out_pid);
+        } else {
+            new_argv[new_argc++] = "/bin/bsh";
+            new_argv[new_argc++] = full_path;
+            for (int i = 1; i < argc; i++) {
+                if (new_argc < MAX_ARGS - 1) {
+                    new_argv[new_argc++] = argv[i];
+                }
+            }
+            new_argv[new_argc] = NULL;
+            return execute_argv_inner(new_argc, new_argv, depth + 1, isolated, background, want_exit, out_pid);
+        }
+    }
+
     char args_buf[256];
     build_args_string(argc, argv, 1, args_buf, sizeof(args_buf));
 
@@ -2431,6 +2497,7 @@ static int read_line(char *out, int max_len, const char *prompt_tmpl) {
 int main(int argc, char **argv) {
     char start_dir[256];
     start_dir[0] = 0;
+    const char *script_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (str_eq(argv[i], "-t") && i + 1 < argc) {
             g_tty_id = atoi(argv[i + 1]);
@@ -2438,6 +2505,19 @@ int main(int argc, char **argv) {
         } else if (str_eq(argv[i], "-d") && i + 1 < argc) {
             str_copy(start_dir, argv[i + 1], sizeof(start_dir));
             i++;
+        } else {
+            bool is_num = true;
+            for (int j = 0; argv[i][j]; j++) {
+                if (argv[i][j] < '0' || argv[i][j] > '9') {
+                    is_num = false;
+                    break;
+                }
+            }
+            if (is_num) {
+                g_tty_id = atoi(argv[i]) - 1;
+            } else {
+                script_path = argv[i];
+            }
         }
     }
 
@@ -2458,8 +2538,18 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (g_cfg.startup[0]) {
+    if (!script_path && g_cfg.startup[0]) {
         run_script(g_cfg.startup);
+    }
+
+    if (script_path) {
+        if (!run_script(script_path)) {
+            set_color(g_color_error);
+            printf("bsh: cannot run script: %s\n", script_path);
+            reset_color();
+            return 1;
+        }
+        return 0;
     }
 
     while (1) {
