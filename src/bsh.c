@@ -955,7 +955,8 @@ static int collect_command_matches(const char *prefix, char matches[][MAX_MATCH_
         }
     }
 
-    FAT32_FileInfo entries[128];
+    FAT32_FileInfo *entries = malloc(sizeof(FAT32_FileInfo) * 128);
+    if (!entries) return count;
     for (int i = 0; i < g_path_count; i++) {
         int got = sys_list(g_paths[i], entries, 128);
         if (got <= 0) continue;
@@ -966,14 +967,19 @@ static int collect_command_matches(const char *prefix, char matches[][MAX_MATCH_
             }
         }
     }
+    free(entries);
     return count;
 }
 
 static int collect_path_matches(const char *dir_part, const char *prefix, char matches[][MAX_MATCH_LEN]) {
     const char *list_dir = (dir_part && dir_part[0]) ? dir_part : ".";
-    FAT32_FileInfo entries[128];
+    FAT32_FileInfo *entries = malloc(sizeof(FAT32_FileInfo) * 128);
+    if (!entries) return 0;
     int got = sys_list(list_dir, entries, 128);
-    if (got <= 0) return 0;
+    if (got <= 0) {
+        free(entries);
+        return 0;
+    }
 
     int count = 0;
     for (int i = 0; i < got; i++) {
@@ -982,6 +988,7 @@ static int collect_path_matches(const char *dir_part, const char *prefix, char m
         build_path_match(dir_part, entries[i].name, entries[i].is_directory, full, sizeof(full));
         count = add_match_unique(matches, count, full);
     }
+    free(entries);
     return count;
 }
 
@@ -1261,12 +1268,19 @@ static int builtin_ls(int argc, char *argv[]) {
         return 0;
     }
 
-    FAT32_FileInfo entries[128];
+    FAT32_FileInfo *entries = malloc(sizeof(FAT32_FileInfo) * 128);
+    if (!entries) {
+        set_color(g_color_error);
+        printf("ls: out of memory\n");
+        reset_color();
+        return 1;
+    }
     int count = sys_list(path, entries, 128);
     if (count < 0) {
         set_color(g_color_error);
         printf("ls: cannot list %s\n", path);
         reset_color();
+        free(entries);
         return 1;
     }
 
@@ -1288,6 +1302,7 @@ static int builtin_ls(int argc, char *argv[]) {
         }
     }
     reset_color();
+    free(entries);
     return 0;
 }
 
@@ -1402,7 +1417,8 @@ static void copy_recursive(const char *src, const char *dst) {
 
     if (info.is_directory) {
         sys_mkdir(dst);
-        FAT32_FileInfo entries[64];
+        FAT32_FileInfo *entries = malloc(sizeof(FAT32_FileInfo) * 64);
+        if (!entries) return;
         int count = sys_list(src, entries, 64);
         for (int i = 0; i < count; i++) {
             if (str_eq(entries[i].name, ".") || str_eq(entries[i].name, "..")) continue;
@@ -1411,6 +1427,7 @@ static void copy_recursive(const char *src, const char *dst) {
             combine_path(sub_dst, dst, entries[i].name);
             copy_recursive(sub_src, sub_dst);
         }
+        free(entries);
     } else {
         int fd_in = sys_open(src, "r");
         if (fd_in < 0) return;
