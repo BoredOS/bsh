@@ -10,8 +10,8 @@ export PATH="/bin"
 # Scripts to run automatically.
 # STARTUP runs for interactive shells.
 # BOOT_SCRIPT runs once on boot (if enabled by the shell).
-STARTUP=/Library/bsh/startup.bsh
-BOOT_SCRIPT=/Library/bsh/boot.bsh
+STARTUP=/Library/AppData/org.boredos.bsh/startup.bsh
+BOOT_SCRIPT=/Library/AppData/org.boredos.bsh/boot.bsh
 
 # Prompt templates.
 # Tokens:
@@ -35,7 +35,7 @@ PROMPT_MINIMAL_HISTORY=true
 PROMPT_MINIMAL_PREFIX="> "
 
 # History settings.
-HISTORY_FILE=/Library/bsh/history
+HISTORY_FILE=/Library/AppData/org.boredos.bsh/history
 HISTORY_SIZE=200
 
 # Feature toggles.

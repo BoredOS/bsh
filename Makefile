@@ -65,8 +65,8 @@ obj/%.o: src/%.c
 install: all
 	mkdir -p $(DESTDIR)/bin
 	cp $(APPS) $(DESTDIR)/bin/
-	mkdir -p $(DESTDIR)/Library/bsh
-	cp assets/* $(DESTDIR)/Library/bsh/
+	mkdir -p $(DESTDIR)/Library/AppData/org.boredos.bsh
+	cp assets/* $(DESTDIR)/Library/AppData/org.boredos.bsh/
 
 clean:
 	rm -rf obj build $(APPS)

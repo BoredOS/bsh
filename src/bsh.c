@@ -269,7 +269,7 @@ static void config_defaults(void) {
     str_copy(g_cfg.prompt_left, DEFAULT_PROMPT, sizeof(g_cfg.prompt_left));
     str_copy(g_cfg.prompt_right, "", sizeof(g_cfg.prompt_right));
     str_copy(g_cfg.prompt_minimal_prefix, "> ", sizeof(g_cfg.prompt_minimal_prefix));
-    str_copy(g_cfg.history_file, "/Library/bsh/history", sizeof(g_cfg.history_file));
+    str_copy(g_cfg.history_file, "/Library/AppData/org.boredos.bsh/history", sizeof(g_cfg.history_file));
     g_cfg.history_size = 200;
     g_cfg.prompt_minimal_history = false;
     g_cfg.glob_enabled = true;
@@ -452,7 +452,7 @@ static void render_prompt(const char *tmpl, char *out, int max_len, bool do_writ
 static void config_load(void) {
     config_defaults();
 
-    int fd = sys_open("/Library/bsh/bshrc", "r");
+    int fd = sys_open("/Library/AppData/org.boredos.bsh/bshrc", "r");
     if (fd < 0) {
         split_path(g_cfg.path);
         return;
@@ -1552,36 +1552,7 @@ static int builtin_mv(int argc, char *argv[]) {
     return 0;
 }
 
-static int builtin_man(int argc, char *argv[]) {
-    if (argc < 2) {
-        set_color(g_color_error);
-        printf("What manual page do you want? Example: man ls\n");
-        reset_color();
-        return 0;
-    }
 
-    char path[128];
-    str_copy(path, "/Library/man/", sizeof(path));
-    str_append(path, argv[1], sizeof(path));
-    str_append(path, ".txt", sizeof(path));
-
-    int fd = sys_open(path, "r");
-    if (fd < 0) {
-        set_color(g_color_error);
-        printf("No manual entry for %s\n", argv[1]);
-        reset_color();
-        return 1;
-    }
-
-    char buffer[4096];
-    int bytes;
-    while ((bytes = sys_read(fd, buffer, sizeof(buffer))) > 0) {
-        shell_write(buffer, bytes);
-    }
-    sys_close(fd);
-    shell_write("\n", 1);
-    return 0;
-}
 
 static int builtin_alias(int argc, char *argv[]) {
     if (argc == 1) {
@@ -1641,7 +1612,7 @@ static int execute_builtin(int argc, char *argv[]) {
     if (str_eq(argv[0], "touch")) return builtin_touch(argc, argv);
     if (str_eq(argv[0], "cp")) return builtin_cp(argc, argv);
     if (str_eq(argv[0], "mv")) return builtin_mv(argc, argv);
-    if (str_eq(argv[0], "man")) return builtin_man(argc, argv);
+
     if (str_eq(argv[0], "alias")) return builtin_alias(argc, argv);
     if (str_eq(argv[0], "unalias")) return builtin_unalias(argc, argv);
     if (str_eq(argv[0], "time")) return builtin_time(argc, argv);
@@ -2548,9 +2519,9 @@ int main(int argc, char **argv) {
     history_load();
 
     if (g_cfg.boot_script[0]) {
-        if (!sys_exists("/Library/bsh/.boot_ran")) {
+        if (!sys_exists("/Library/AppData/org.boredos.bsh/.boot_ran")) {
             run_script(g_cfg.boot_script);
-            int fd = sys_open("/Library/bsh/.boot_ran", "w");
+            int fd = sys_open("/Library/AppData/org.boredos.bsh/.boot_ran", "w");
             if (fd >= 0) sys_close(fd);
         }
     }
