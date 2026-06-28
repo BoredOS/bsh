@@ -349,11 +349,11 @@ static void load_shell_colors(void) {
 }
 
 static void set_color(uint32_t color) {
-    sys_set_text_color(color);
+    set_text_color(color);
 }
 
 static void reset_color(void) {
-    sys_set_text_color(g_color_default);
+    set_text_color(g_color_default);
 }
 
 static void shell_write(const char *buf, int len) {
@@ -608,7 +608,7 @@ static void history_add(const char *line) {
 
 static void get_time_string(char *out, int max_len) {
     int dt[6] = {0};
-    sys_system(SYSTEM_CMD_RTC_GET, (uint64_t)dt, 0, 0, 0);
+    rtc_get(dt);
     char hh[4], mm[4];
     itoa(dt[3], hh);
     itoa(dt[4], mm);
@@ -1215,7 +1215,7 @@ static int builtin_time(int argc, char *argv[]) {
 
     printf("Elapsed: %llu ms\n", elapsed);
 
-    sys_system(SYSTEM_CMD_SLEEP, 1, 0, 0, 0);
+    sleep(1);
 
     return ret;
 }
