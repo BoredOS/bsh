@@ -55,6 +55,19 @@ typedef struct {
 static alias_t g_aliases[MAX_ALIASES];
 static int g_alias_count = 0;
 
+#define MAX_VARIABLES 128
+#define MAX_VAR_NAME 64
+#define MAX_VAR_VALUE 512
+
+typedef struct {
+    char name[MAX_VAR_NAME];
+    char value[MAX_VAR_VALUE];
+} shell_var_t;
+
+static shell_var_t g_variables[MAX_VARIABLES];
+static int g_var_count = 0;
+
+
 static int g_tty_id = -1;
 static uint32_t g_color_dir = 0;
 static uint32_t g_color_file = 0;
@@ -260,6 +273,192 @@ static const char *alias_get(const char *name) {
         if (str_eq(g_aliases[i].name, name)) return g_aliases[i].value;
     }
     return NULL;
+}
+
+static void var_set(const char *name, const char *value) {
+    if (!name || !name[0]) return;
+    for (int i = 0; i < g_var_count; i++) {
+        if (str_eq(g_variables[i].name, name)) {
+            str_copy(g_variables[i].value, value, sizeof(g_variables[i].value));
+            return;
+        }
+    }
+    if (g_var_count >= MAX_VARIABLES) return;
+    str_copy(g_variables[g_var_count].name, name, sizeof(g_variables[g_var_count].name));
+    str_copy(g_variables[g_var_count].value, value, sizeof(g_variables[g_var_count].value));
+    g_var_count++;
+}
+
+static const char *var_get(const char *name) {
+    if (!name || !name[0]) return NULL;
+    for (int i = 0; i < g_var_count; i++) {
+        if (str_eq(g_variables[i].name, name)) return g_variables[i].value;
+    }
+    return getenv(name);
+}
+
+static void var_set_int(const char *name, int val) {
+    char buf[16];
+    itoa(val, buf);
+    var_set(name, buf);
+}
+
+static void set_positional_args(int argc, char *argv[], int start_idx) {
+    char name[16];
+    for (int i = 1; i < 100; i++) {
+        itoa(i, name);
+        const char *existing = var_get(name);
+        if (!existing) break;
+        var_set(name, "");
+    }
+    int count = 0;
+    if (argv) {
+        for (int i = start_idx; i < argc; i++) {
+            itoa(count + 1, name);
+            var_set(name, argv[i]);
+            count++;
+        }
+    }
+    var_set_int("#", count);
+    
+    char all_args[1024] = {0};
+    for (int i = 0; i < count; i++) {
+        itoa(i + 1, name);
+        const char *val = var_get(name);
+        if (val) {
+            if (i > 0) str_append(all_args, " ", sizeof(all_args));
+            str_append(all_args, val, sizeof(all_args));
+        }
+    }
+    var_set("*", all_args);
+    var_set("@", all_args);
+}
+
+typedef struct {
+    int count;
+    char *args[100];
+} positional_backup_t;
+
+static void backup_positional_args(positional_backup_t *backup) {
+    char name[16];
+    backup->count = 0;
+    for (int i = 1; i < 100; i++) {
+        itoa(i, name);
+        const char *val = var_get(name);
+        if (val && val[0]) {
+            backup->args[backup->count] = strdup(val);
+            backup->count++;
+        } else {
+            break;
+        }
+    }
+}
+
+static void restore_positional_args(const positional_backup_t *backup) {
+    char name[16];
+    for (int i = 1; i < 100; i++) {
+        itoa(i, name);
+        const char *val = var_get(name);
+        if (!val) break;
+        var_set(name, "");
+    }
+    for (int i = 0; i < backup->count; i++) {
+        itoa(i + 1, name);
+        var_set(name, backup->args[i]);
+        free(backup->args[i]);
+    }
+    var_set_int("#", backup->count);
+    
+    char all_args[1024] = {0};
+    for (int i = 0; i < backup->count; i++) {
+        itoa(i + 1, name);
+        const char *val = var_get(name);
+        if (val) {
+            if (i > 0) str_append(all_args, " ", sizeof(all_args));
+            str_append(all_args, val, sizeof(all_args));
+        }
+    }
+    var_set("*", all_args);
+    var_set("@", all_args);
+}
+
+static int expand_variable_at(const char *line, int i, char *val_out, int val_max) {
+    val_out[0] = 0;
+    if (line[i] == '{') {
+        int start = i + 1;
+        int len = 0;
+        while (line[start + len] && line[start + len] != '}') {
+            len++;
+        }
+        if (line[start + len] == '}') {
+            char name[64];
+            if (len < (int)sizeof(name)) {
+                memcpy(name, &line[start], len);
+                name[len] = 0;
+                const char *val = var_get(name);
+                if (val) str_copy(val_out, val, val_max);
+            }
+            return len + 2;
+        }
+    }
+    char c = line[i];
+    if (c >= '0' && c <= '9') {
+        char name[2] = { c, 0 };
+        const char *val = var_get(name);
+        if (val) str_copy(val_out, val, val_max);
+        return 1;
+    }
+    if (c == '?' || c == '#' || c == '*' || c == '@' || c == '$') {
+        char name[2] = { c, 0 };
+        const char *val = var_get(name);
+        if (val) str_copy(val_out, val, val_max);
+        return 1;
+    }
+    int len = 0;
+    if ((line[i] >= 'a' && line[i] <= 'z') || (line[i] >= 'A' && line[i] <= 'Z') || line[i] == '_') {
+        len = 1;
+        while ((line[i + len] >= 'a' && line[i + len] <= 'z') ||
+               (line[i + len] >= 'A' && line[i + len] <= 'Z') ||
+               (line[i + len] >= '0' && line[i + len] <= '9') ||
+               line[i + len] == '_') {
+            len++;
+        }
+        char name[64];
+        if (len < (int)sizeof(name)) {
+            memcpy(name, &line[i], len);
+            name[len] = 0;
+            const char *val = var_get(name);
+            if (val) str_copy(val_out, val, val_max);
+        }
+    }
+    return len;
+}
+
+static bool is_valid_var_name(const char *name) {
+    if (!name || !name[0]) return false;
+    if (!((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z') || name[0] == '_')) {
+        return false;
+    }
+    for (int i = 1; name[i]; i++) {
+        if (!((name[i] >= 'a' && name[i] <= 'z') || (name[i] >= 'A' && name[i] <= 'Z') || (name[i] >= '0' && name[i] <= '9') || name[i] == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool parse_assignment(const char *arg, char *name, int name_max, char *value, int val_max) {
+    const char *eq = strchr(arg, '=');
+    if (!eq) return false;
+    int name_len = eq - arg;
+    if (name_len >= name_max) return false;
+    char name_tmp[64];
+    memcpy(name_tmp, arg, name_len);
+    name_tmp[name_len] = 0;
+    if (!is_valid_var_name(name_tmp)) return false;
+    str_copy(name, name_tmp, name_max);
+    str_copy(value, eq + 1, val_max);
+    return true;
 }
 
 static void config_defaults(void) {
@@ -855,10 +1054,28 @@ static char *resolve_command_path(const char *cmd, char *const envp[]) {
 
     if (!cmd || !cmd[0]) return NULL;
 
+    if (str_eq(cmd, "/bin/sh") || str_eq(cmd, "/usr/bin/sh")) {
+        cmd = "/bin/bsh";
+    }
+
     if (contains_slash(cmd)) {
         res = accept_command_candidate(cmd);
+        if (res == 0) {
+            g_resolve_status = 0;
+            return g_resolved_command_path;
+        }
+        if (!ends_with(cmd, ".elf")) {
+            char with_ext[256];
+            str_copy(with_ext, cmd, sizeof(with_ext));
+            str_append(with_ext, ".elf", sizeof(with_ext));
+            res = accept_command_candidate(with_ext);
+            if (res == 0) {
+                g_resolve_status = 0;
+                return g_resolved_command_path;
+            }
+        }
         g_resolve_status = res;
-        return (res == 0) ? g_resolved_command_path : NULL;
+        return NULL;
     }
 
     path = env_get_value(envp, "PATH");
@@ -1149,6 +1366,9 @@ static unsigned long long read_uptime_ms(void) {
     return (unsigned long long)seconds * 1000ULL;
 }
 
+static bool is_builtin_name(const char *name);
+static int execute_builtin(int argc, char *argv[]);
+
 static int builtin_time(int argc, char *argv[]) {
     char *resolved;
     char full_path[256];
@@ -1170,36 +1390,42 @@ static int builtin_time(int argc, char *argv[]) {
         return 0;
     }
 
-    resolved = resolve_command_path(argv[1], NULL);
-    if (!resolved) {
-        print_command_resolution_error("time", argv[1], g_resolve_status);
-        return 1;
-    }
-    str_copy(full_path, resolved, sizeof(full_path));
-
     build_args_string(argc, argv, 2, args_buf, sizeof(args_buf));
 
-    str_copy(cmdline, full_path, sizeof(cmdline));
+    str_copy(cmdline, argv[1], sizeof(cmdline));
     if (args_buf[0]) {
         str_append(cmdline, " ", sizeof(cmdline));
         str_append(cmdline, args_buf, sizeof(cmdline));
     }
 
-    start = read_uptime_ms();
+    if (is_builtin_name(argv[1])) {
+        start = read_uptime_ms();
+        ret = execute_builtin(argc - 1, argv + 1);
+        end = read_uptime_ms();
+    } else {
+        resolved = resolve_command_path(argv[1], NULL);
+        if (!resolved) {
+            print_command_resolution_error("time", argv[1], g_resolve_status);
+            return 1;
+        }
+        str_copy(full_path, resolved, sizeof(full_path));
 
-    for (int attempt = 0; attempt < 5; attempt++) {
-        pid = sys_spawn(full_path, args_buf[0] ? args_buf : NULL, SPAWN_FLAG_TERMINAL | SPAWN_FLAG_INHERIT_TTY, 0);
-        if (pid >= 0) break;
-        usleep(10 * 1000);
+        start = read_uptime_ms();
+
+        for (int attempt = 0; attempt < 5; attempt++) {
+            pid = sys_spawn(full_path, args_buf[0] ? args_buf : NULL, SPAWN_FLAG_TERMINAL | SPAWN_FLAG_INHERIT_TTY, 0);
+            if (pid >= 0) break;
+            usleep(10 * 1000);
+        }
+
+        if (pid >= 0) {
+            if (g_tty_id >= 0) sys_tty_set_fg(g_tty_id, pid);
+            if (wait_for_pid_status(pid, &ret) != 0) ret = -1;
+            if (g_tty_id >= 0) sys_tty_set_fg(g_tty_id, 0);
+        }
+
+        end = read_uptime_ms();
     }
-
-    if (pid >= 0) {
-        if (g_tty_id >= 0) sys_tty_set_fg(g_tty_id, pid);
-        if (wait_for_pid_status(pid, &ret) != 0) ret = -1;
-        if (g_tty_id >= 0) sys_tty_set_fg(g_tty_id, 0);
-    }
-
-    end = read_uptime_ms();
 
     if (end >= start) elapsed = end - start;
     else elapsed = 0;
@@ -1599,6 +1825,31 @@ static int builtin_unalias(int argc, char *argv[]) {
     return 0;
 }
 
+static int builtin_export(int argc, char *argv[]) {
+    if (argc < 2) {
+        for (int i = 0; i < g_var_count; i++) {
+            shell_write("export ", 7);
+            shell_write(g_variables[i].name, (int)strlen(g_variables[i].name));
+            shell_write("=\"", 2);
+            shell_write(g_variables[i].value, (int)strlen(g_variables[i].value));
+            shell_writeln("\"");
+        }
+        return 0;
+    }
+    for (int i = 1; i < argc; i++) {
+        char name[MAX_VAR_NAME];
+        char value[MAX_VAR_VALUE];
+        if (parse_assignment(argv[i], name, sizeof(name), value, sizeof(value))) {
+            var_set(name, value);
+        } else {
+            const char *val = var_get(argv[i]);
+            if (!val) val = "";
+            var_set(argv[i], val);
+        }
+    }
+    return 0;
+}
+
 static int execute_builtin(int argc, char *argv[]) {
     if (argc == 0) return 0;
     if (str_eq(argv[0], "cd")) return builtin_cd(argc, argv);
@@ -1616,14 +1867,25 @@ static int execute_builtin(int argc, char *argv[]) {
     if (str_eq(argv[0], "alias")) return builtin_alias(argc, argv);
     if (str_eq(argv[0], "unalias")) return builtin_unalias(argc, argv);
     if (str_eq(argv[0], "time")) return builtin_time(argc, argv);
+    if (str_eq(argv[0], "export")) return builtin_export(argc, argv);
     if (str_eq(argv[0], ".")) {
         if (argc < 2) {
             set_color(g_color_error);
-            printf("Usage: . <script>\n");
+            printf("Usage: . <script> [args...]\n");
             reset_color();
             return 1;
         }
-        if (!run_script(argv[1])) {
+        bool has_args = (argc > 2);
+        positional_backup_t backup;
+        if (has_args) {
+            backup_positional_args(&backup);
+            set_positional_args(argc, argv, 2);
+        }
+        bool ok = run_script(argv[1]);
+        if (has_args) {
+            restore_positional_args(&backup);
+        }
+        if (!ok) {
             set_color(g_color_error);
             printf("bsh: cannot run script: %s\n", argv[1]);
             reset_color();
@@ -1641,7 +1903,7 @@ static bool is_builtin_name(const char *name) {
            str_eq(name, "mkdir") || str_eq(name, "rm") || str_eq(name, "touch") ||
            str_eq(name, "cp") || str_eq(name, "mv") || str_eq(name, "man") ||
            str_eq(name, "alias") || str_eq(name, "unalias") || str_eq(name, ".") ||
-           str_eq(name, "exit");
+           str_eq(name, "export") || str_eq(name, "exit");
 }
 
 typedef enum {
@@ -1709,6 +1971,9 @@ static int tokenize_line(const char *line, bsh_token_t toks[], int max_toks) {
     while (line[i]) {
         while (line[i] == ' ' || line[i] == '\t') i++;
         if (!line[i]) break;
+        if (line[i] == '#') {
+            break; // Comment starts here!
+        }
         if (tcount >= max_toks - 1) {
             print_syntax_error("too many tokens");
             return -1;
@@ -1775,14 +2040,61 @@ static int tokenize_line(const char *line, bsh_token_t toks[], int max_toks) {
         toks[tcount].type = TOK_WORD;
         int out = 0;
         while (line[i] && line[i] != ' ' && line[i] != '\t' && !is_op_char(line[i])) {
-            if (line[i] == '"' || line[i] == '\'') {
-                char quote = line[i++];
-                while (line[i] && line[i] != quote) {
+            if (line[i] == '\\') {
+                i++;
+                if (line[i]) {
                     if (out < MAX_MATCH_LEN - 1) toks[tcount].text[out++] = line[i];
                     i++;
                 }
-                if (line[i] == quote) i++;
                 continue;
+            }
+            if (line[i] == '\'') {
+                i++;
+                while (line[i] && line[i] != '\'') {
+                    if (out < MAX_MATCH_LEN - 1) toks[tcount].text[out++] = line[i];
+                    i++;
+                }
+                if (line[i] == '\'') i++;
+                continue;
+            }
+            if (line[i] == '"') {
+                i++;
+                while (line[i] && line[i] != '"') {
+                    if (line[i] == '\\') {
+                        char next = line[i + 1];
+                        if (next == '$' || next == '"' || next == '\\') {
+                            if (out < MAX_MATCH_LEN - 1) toks[tcount].text[out++] = next;
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    if (line[i] == '$') {
+                        char val[MAX_VAR_VALUE];
+                        int consumed = expand_variable_at(line, i + 1, val, sizeof(val));
+                        if (consumed > 0) {
+                            for (int k = 0; val[k] && out < MAX_MATCH_LEN - 1; k++) {
+                                toks[tcount].text[out++] = val[k];
+                            }
+                            i += 1 + consumed;
+                            continue;
+                        }
+                    }
+                    if (out < MAX_MATCH_LEN - 1) toks[tcount].text[out++] = line[i];
+                    i++;
+                }
+                if (line[i] == '"') i++;
+                continue;
+            }
+            if (line[i] == '$') {
+                char val[MAX_VAR_VALUE];
+                int consumed = expand_variable_at(line, i + 1, val, sizeof(val));
+                if (consumed > 0) {
+                    for (int k = 0; val[k] && out < MAX_MATCH_LEN - 1; k++) {
+                        toks[tcount].text[out++] = val[k];
+                    }
+                    i += 1 + consumed;
+                    continue;
+                }
             }
             if (out < MAX_MATCH_LEN - 1) toks[tcount].text[out++] = line[i];
             i++;
@@ -1849,6 +2161,26 @@ static int execute_argv_inner(int argc, char *argv[], int depth, bool isolated, 
     if (argc <= 0) return 0;
     if (depth > 8) return 1;
     if (out_pid) *out_pid = -1;
+
+    bool is_pure_assignment = true;
+    for (int i = 0; i < argc; i++) {
+        char name[MAX_VAR_NAME];
+        char value[MAX_VAR_VALUE];
+        if (!parse_assignment(argv[i], name, sizeof(name), value, sizeof(value))) {
+            is_pure_assignment = false;
+            break;
+        }
+    }
+    if (is_pure_assignment) {
+        for (int i = 0; i < argc; i++) {
+            char name[MAX_VAR_NAME];
+            char value[MAX_VAR_VALUE];
+            if (parse_assignment(argv[i], name, sizeof(name), value, sizeof(value))) {
+                var_set(name, value);
+            }
+        }
+        return 0;
+    }
 
     if (!str_eq(argv[0], "alias") && !str_eq(argv[0], "unalias")) {
         const char *alias_val = alias_get(argv[0]);
@@ -2211,6 +2543,7 @@ static int execute_line(const char *line) {
         if (toks[end_idx].type == TOK_AMP) background = true;
 
         status = execute_conditional_range(toks, idx, end_idx, background, &want_exit);
+        var_set_int("?", status);
         if (want_exit) return 2;
 
         idx = end_idx;
@@ -2482,10 +2815,35 @@ static int read_line(char *out, int max_len, const char *prompt_tmpl) {
     }
 }
 
+static bool is_binary_file(const char *path) {
+    int fd = sys_open(path, "r");
+    if (fd < 0) return false;
+    unsigned char buf[128];
+    int n = sys_read(fd, buf, sizeof(buf));
+    sys_close(fd);
+    if (n <= 0) return false;
+
+    // Check for ELF header first
+    if (n >= 4 && buf[0] == 0x7F && buf[1] == 'E' && buf[2] == 'L' && buf[3] == 'F') {
+        return true;
+    }
+
+    // Check if it starts with shebang - if so, it's a script
+    if (n >= 2 && buf[0] == '#' && buf[1] == '!') {
+        return false;
+    }
+
+    // Check for null bytes or excessive non-printable ASCII in the first block
+    for (int i = 0; i < n; i++) {
+        if (buf[i] == 0) return true; // Null byte -> definitely binary
+    }
+    return false;
+}
+
 int main(int argc, char **argv) {
     char start_dir[256];
     start_dir[0] = 0;
-    const char *script_path = NULL;
+    int script_arg_index = -1;
     for (int i = 1; i < argc; i++) {
         if (str_eq(argv[i], "-t") && i + 1 < argc) {
             g_tty_id = atoi(argv[i + 1]);
@@ -2504,7 +2862,8 @@ int main(int argc, char **argv) {
             if (is_num) {
                 g_tty_id = atoi(argv[i]) - 1;
             } else {
-                script_path = argv[i];
+                script_arg_index = i;
+                break;
             }
         }
     }
@@ -2513,7 +2872,7 @@ int main(int argc, char **argv) {
     load_shell_colors();
     if (start_dir[0]) {
         chdir(start_dir);
-    } else if (sys_exists("/root")) {
+    } else if (script_arg_index < 0 && sys_exists("/root")) {
         chdir("/root");
     }
     history_load();
@@ -2526,18 +2885,41 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (!script_path && g_cfg.startup[0]) {
+    if (script_arg_index < 0 && g_cfg.startup[0]) {
         run_script(g_cfg.startup);
     }
 
-    if (script_path) {
-        if (!run_script(script_path)) {
-            set_color(g_color_error);
-            printf("bsh: cannot run script: %s\n", script_path);
-            reset_color();
-            return 1;
+    if (script_arg_index >= 0) {
+        const char *exec_path = argv[script_arg_index];
+        char resolved[256];
+        bool is_script = false;
+
+        if (resolve_script_path(exec_path, resolved, sizeof(resolved))) {
+            if (!is_binary_file(resolved)) {
+                is_script = true;
+            }
         }
-        return 0;
+
+        var_set("0", exec_path);
+        set_positional_args(argc, argv, script_arg_index + 1);
+
+        if (is_script) {
+            if (!run_script(resolved)) {
+                set_color(g_color_error);
+                printf("bsh: cannot run script: %s\n", exec_path);
+                reset_color();
+                return 1;
+            }
+            return 0;
+        } else {
+            char cmdline[MAX_LINE];
+            build_args_string(argc, argv, script_arg_index, cmdline, sizeof(cmdline));
+            int res = execute_line(cmdline);
+            return res;
+        }
+    } else {
+        var_set("0", "bsh");
+        set_positional_args(0, NULL, 0);
     }
 
     while (1) {
