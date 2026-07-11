@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Christiaan (chris@boreddev.nl)
 # Bored Shell Makefile (Supports Standalone & Integrated builds)
 
-CC = x86_64-elf-gcc
-LD = x86_64-elf-ld
+CC = x86_64-boredos-gcc
+LD = x86_64-boredos-ld
 
 # Smart SDK Resolution Logic
 ifneq ($(BOREDOS_SDK),)
