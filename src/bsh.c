@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <syscall.h>
 #include <stdbool.h>
+#include <poll.h>
 #include "utf-8.h"
 
 #define MAX_LINE 512
