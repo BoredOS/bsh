@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <syscall.h>
+#include <sys/ioctl.h>
 #include <stdbool.h>
 #include <poll.h>
 #include "utf-8.h"
@@ -1296,8 +1297,8 @@ static int wait_for_pid_status(int pid, int *status) {
 
         if (rc < 0) return -1;
 
-        if (g_tty_id >= 0) {
-            int fg = sys_tty_get_fg(g_tty_id);
+        int fg = -1;
+        if (ioctl(0, 0x540F /* TIOCGPGRP */, &fg) == 0 && fg > 0) {
             if (fg != pid) return -1;
         }
 
@@ -1420,9 +1421,11 @@ static int builtin_time(int argc, char *argv[]) {
         }
 
         if (pid >= 0) {
-            if (g_tty_id >= 0) sys_tty_set_fg(g_tty_id, pid);
+            int fg = pid;
+            ioctl(0, 0x5410 /* TIOCSPGRP */, &fg);
             if (wait_for_pid_status(pid, &ret) != 0) ret = -1;
-            if (g_tty_id >= 0) sys_tty_set_fg(g_tty_id, 0);
+            fg = 0;
+            ioctl(0, 0x5410 /* TIOCSPGRP */, &fg);
         }
 
         end = read_uptime_ms();
@@ -2289,9 +2292,11 @@ static int execute_argv_inner(int argc, char *argv[], int depth, bool isolated, 
     if (out_pid) *out_pid = pid;
     if (background) return 0;
 
-    if (g_tty_id >= 0) sys_tty_set_fg(g_tty_id, pid);
+    int fg = pid;
+    ioctl(0, 0x5410 /* TIOCSPGRP */, &fg);
     int status = wait_for_pid(pid);
-    if (g_tty_id >= 0) sys_tty_set_fg(g_tty_id, 0);
+    fg = 0;
+    ioctl(0, 0x5410 /* TIOCSPGRP */, &fg);
     return status;
 }
 
@@ -2607,7 +2612,7 @@ static int read_line(char *out, int max_len, const char *prompt_tmpl) {
         poll(&pfd, 1, -1); // Wait indefinitely
 
         char ch = 0;
-        int got = sys_tty_read_in(&ch, 1);
+        int got = read(0, &ch, 1);
         if (got <= 0) continue;
 
         if (ch == 3) { // Ctrl+C
@@ -2721,8 +2726,8 @@ static int read_line(char *out, int max_len, const char *prompt_tmpl) {
             char seq[2];
             int g1 = 0, g2 = 0;
             struct pollfd pfd = { .fd = 0, .events = POLLIN, .revents = 0 };
-            if (poll(&pfd, 1, 50) > 0) g1 = sys_tty_read_in(&seq[0], 1);
-            if (g1 > 0 && poll(&pfd, 1, 50) > 0) g2 = sys_tty_read_in(&seq[1], 1);
+            if (poll(&pfd, 1, 50) > 0) g1 = read(0, &seq[0], 1);
+            if (g1 > 0 && poll(&pfd, 1, 50) > 0) g2 = read(0, &seq[1], 1);
             
             if (g1 > 0 && g2 > 0 && seq[0] == '[') {
                 if (seq[1] == 'A') ch = 17;
@@ -2924,7 +2929,8 @@ int main(int argc, char **argv) {
     }
 
     while (1) {
-        if (g_tty_id >= 0) sys_tty_set_fg(g_tty_id, 0);
+        int fg = 0;
+        ioctl(0, 0x5410 /* TIOCSPGRP */, &fg);
 
         const char *prompt_tmpl = g_cfg.prompt_left[0] ? g_cfg.prompt_left : DEFAULT_PROMPT;
         sys_write(1, "\r", 1);
