@@ -631,7 +631,15 @@ static void render_prompt(const char *tmpl, char *out, int max_len, bool do_writ
                 continue;
             }
             if (token == 'h') {
-                const char *host = "boredos";
+                char host[64] = "";
+                FILE *hf = fopen("/etc/hostname", "r");
+                if (hf) {
+                    if (fgets(host, sizeof(host), hf)) {
+                        char *nl = strchr(host, '\n'); if (nl) *nl = '\0';
+                        char *cr = strchr(host, '\r'); if (cr) *cr = '\0';
+                    }
+                    fclose(hf);
+                }
                 prompt_emit(host, (int)strlen(host), out, &out_idx, max_len, do_write);
                 i++;
                 continue;
@@ -2640,12 +2648,19 @@ static int read_line(char *out, int max_len, const char *prompt_tmpl) {
             if (cursor > 0) {
                 const char *prev = text_prev_utf8(out, out + cursor);
                 int shift = (int)(out + cursor - prev);
+                bool at_end = (cursor == len);
                 for (int i = cursor; i <= len; i++) {
                     out[i - shift] = out[i];
                 }
                 cursor -= shift;
                 len -= shift;
-                redraw_input(prompt_tmpl, out, len, cursor);
+                if (at_end) {
+                    for (int s = 0; s < shift; s++) {
+                        sys_write(1, "\b \b", 3);
+                    }
+                } else {
+                    redraw_input(prompt_tmpl, out, len, cursor);
+                }
             }
             search_mode = false;
             hist_index = g_history_count;
@@ -2793,7 +2808,7 @@ static int read_line(char *out, int max_len, const char *prompt_tmpl) {
             if (cursor > 0) {
                 const char *prev = text_prev_utf8(out, out + cursor);
                 if (prev) cursor = (int)(prev - out);
-                redraw_input(prompt_tmpl, out, len, cursor);
+                sys_write(1, "\x1b[D", 3);
             }
             continue;
         }
@@ -2803,18 +2818,23 @@ static int read_line(char *out, int max_len, const char *prompt_tmpl) {
                 const char *next = text_next_utf8(out + cursor);
                 if (next && *next) cursor = (int)(next - out);
                 else cursor = len;
-                redraw_input(prompt_tmpl, out, len, cursor);
+                sys_write(1, "\x1b[C", 3);
             }
             continue;
         }
 
         if (((unsigned char)ch >= 32 || (signed char)ch < 0) && len < max_len - 1) {
+            bool at_end = (cursor == len);
             for (int i = len; i >= cursor; i--) {
                 out[i + 1] = out[i];
             }
             out[cursor++] = ch;
             len++;
-            redraw_input(prompt_tmpl, out, len, cursor);
+            if (at_end) {
+                sys_write(1, &ch, 1);
+            } else {
+                redraw_input(prompt_tmpl, out, len, cursor);
+            }
             search_mode = false;
             hist_index = g_history_count;
         }
