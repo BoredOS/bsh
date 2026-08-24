@@ -10,7 +10,14 @@
 #include <sys/ioctl.h>
 #include <stdbool.h>
 #include <poll.h>
+#include <signal.h>
 #include "utf-8.h"
+
+static volatile sig_atomic_t g_winch_received = 0;
+static void sigwinch_handler(int sig) {
+    (void)sig;
+    g_winch_received = 1;
+}
 
 #define MAX_LINE 512
 #define MAX_ARGS 32
@@ -1261,8 +1268,7 @@ static void prompt_write_with_right(const char *left_tmpl, const char *right_tmp
 }
 
 static void redraw_input(const char *prompt_tmpl, const char *line, int len, int cursor) {
-    sys_write(1, "\r", 1);
-    sys_write(1, "\x1b[K", 3);
+    sys_write(1, "\r\x1b[2K", 5);
     sys_write(1, "\x1b[?25h", 6);  // Show cursor
     prompt_write_with_right(prompt_tmpl, g_cfg.prompt_right);
     sys_write(1, line, len);
@@ -2616,11 +2622,25 @@ static int read_line(char *out, int max_len, const char *prompt_tmpl) {
     out[0] = 0;
 
     while (1) {
+        if (g_winch_received) {
+            g_winch_received = 0;
+            redraw_input(prompt_tmpl, out, len, cursor);
+        }
+
         struct pollfd pfd = { .fd = 0, .events = POLLIN, .revents = 0 };
-        poll(&pfd, 1, -1); // Wait indefinitely
+        poll(&pfd, 1, -1);
+
+        if (g_winch_received) {
+            g_winch_received = 0;
+            redraw_input(prompt_tmpl, out, len, cursor);
+        }
 
         char ch = 0;
         int got = read(0, &ch, 1);
+        if (g_winch_received) {
+            g_winch_received = 0;
+            redraw_input(prompt_tmpl, out, len, cursor);
+        }
         if (got <= 0) continue;
 
         if (ch == 3) { // Ctrl+C
@@ -2948,13 +2968,14 @@ int main(int argc, char **argv) {
         set_positional_args(0, NULL, 0);
     }
 
+    signal(SIGWINCH, sigwinch_handler);
+
     while (1) {
-        int fg = 0;
+        int fg = getpid();
         ioctl(0, 0x5410 /* TIOCSPGRP */, &fg);
 
         const char *prompt_tmpl = g_cfg.prompt_left[0] ? g_cfg.prompt_left : DEFAULT_PROMPT;
-        sys_write(1, "\r", 1);
-        sys_write(1, "\x1b[K", 3);
+        sys_write(1, "\r\x1b[2K", 5);
         sys_write(1, "\x1b[?25h", 6);  // Show cursor
         prompt_write_with_right(prompt_tmpl, g_cfg.prompt_right);
 
