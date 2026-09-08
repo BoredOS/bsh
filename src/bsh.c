@@ -866,6 +866,7 @@ static int split_args(char *line, char *argv[], int max_args) {
 
 static bool is_file_path(const char *path) {
     FAT32_FileInfo info;
+    memset(&info, 0, sizeof(info));
     if (sys_get_file_info(path, &info) == 0 && !info.is_directory) return true;
     return false;
 }
