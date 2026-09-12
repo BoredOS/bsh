@@ -3,3 +3,7 @@
 # Example:
 # echo "Welcome to BoredShell"
 sysfetch
+
+if [ -f /etc/rc.d/motd ]; then
+    /etc/rc.d/motd start
+fi

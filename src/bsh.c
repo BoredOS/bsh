@@ -1,6 +1,8 @@
 // Copyright (c) 2023-2026 Christiaan (chris@boreddev.nl)
 // This software is released under the GNU General Public License v3.0. See LICENSE file for details.
 // This header needs to maintain in any file it is present in, as per the GPL license terms.
+#include <dirent.h>
+#include <fnmatch.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -8,10 +10,19 @@
 #include <stdio.h>
 #include <syscall.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <stdbool.h>
 #include <poll.h>
 #include <signal.h>
+#include <errno.h>
 #include "utf-8.h"
+
+#ifndef TIOCSCTTY
+#define TIOCSCTTY 0x540E
+#endif
+#ifndef TIOCSPGRP
+#define TIOCSPGRP 0x5410
+#endif
 
 static volatile sig_atomic_t g_winch_received = 0;
 static void sigwinch_handler(int sig) {
@@ -404,8 +415,73 @@ static int expand_variable_at(const char *line, int i, char *val_out, int val_ma
             if (len < (int)sizeof(name)) {
                 memcpy(name, &line[start], len);
                 name[len] = 0;
-                const char *val = var_get(name);
-                if (val) str_copy(val_out, val, val_max);
+                char *sep_def = strstr(name, ":-");
+                char *sep_strip_prefix = strstr(name, "##");
+                char *sep_strip_suffix = strchr(name, '%');
+                if (sep_def) {
+                    *sep_def = 0;
+                    char *def = sep_def + 2;
+                    const char *val = var_get(name);
+                    if (val && val[0]) str_copy(val_out, val, val_max);
+                    else if (def) str_copy(val_out, def, val_max);
+                } else if (sep_strip_prefix) {
+                    *sep_strip_prefix = 0;
+                    char *pattern = sep_strip_prefix + 2;
+                    const char *val = var_get(name);
+                    if (val) {
+                        if (str_eq(pattern, "*/")) {
+                            const char *slash = strrchr(val, '/');
+                            if (slash) str_copy(val_out, slash + 1, val_max);
+                            else str_copy(val_out, val, val_max);
+                        } else {
+                            char temp_val[MAX_VAR_VALUE];
+                            str_copy(temp_val, val, sizeof(temp_val));
+                            size_t vlen = strlen(temp_val);
+                            size_t match_len = 0;
+                            bool found = false;
+                            for (size_t l = vlen; l > 0; l--) {
+                                char saved_c = temp_val[l];
+                                temp_val[l] = '\0';
+                                if (fnmatch(pattern, temp_val, 0) == 0) {
+                                    match_len = l;
+                                    found = true;
+                                    temp_val[l] = saved_c;
+                                    break;
+                                }
+                                temp_val[l] = saved_c;
+                            }
+                            if (found) {
+                                str_copy(val_out, val + match_len, val_max);
+                            } else {
+                                str_copy(val_out, val, val_max);
+                            }
+                        }
+                    }
+                } else if (sep_strip_suffix) {
+                    *sep_strip_suffix = 0;
+                    char *pattern = sep_strip_suffix + 1;
+                    if (*pattern == '%') pattern++;
+                    const char *val = var_get(name);
+                    if (val) {
+                        str_copy(val_out, val, val_max);
+                        size_t vlen = strlen(val_out);
+                        size_t match_start = vlen;
+                        bool found = false;
+                        for (size_t l = 0; l <= vlen; l++) {
+                            if (fnmatch(pattern, val_out + (vlen - l), 0) == 0) {
+                                match_start = vlen - l;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found) {
+                            val_out[match_start] = '\0';
+                        }
+                    }
+                } else {
+                    const char *val = var_get(name);
+                    if (val) str_copy(val_out, val, val_max);
+                }
             }
             return len + 2;
         }
@@ -417,7 +493,7 @@ static int expand_variable_at(const char *line, int i, char *val_out, int val_ma
         if (val) str_copy(val_out, val, val_max);
         return 1;
     }
-    if (c == '?' || c == '#' || c == '*' || c == '@' || c == '$') {
+    if (c == '?' || c == '#' || c == '*' || c == '@' || c == '$' || c == '!') {
         char name[2] = { c, 0 };
         const char *val = var_get(name);
         if (val) str_copy(val_out, val, val_max);
@@ -1073,7 +1149,7 @@ static char *resolve_command_path(const char *cmd, char *const envp[]) {
     if (!cmd || !cmd[0]) return NULL;
 
     if (str_eq(cmd, "/bin/sh") || str_eq(cmd, "/usr/bin/sh")) {
-        cmd = "/bin/bsh";
+        cmd = "/bin/bsh.elf";
     }
 
     if (contains_slash(cmd)) {
@@ -1178,7 +1254,8 @@ static int collect_command_matches(const char *prefix, char matches[][MAX_MATCH_
     int count = 0;
     const char *builtins[] = {
         "cd", "pwd", "ls", "cat", "echo", "clear", "mkdir", "rm",
-        "touch", "cp", "mv", "man", "alias", "unalias", "time", ".", "exit"
+        "touch", "cp", "mv", "man", "alias", "unalias", "time", ".", "exit",
+        "eval", "break", "continue"
     };
     for (int i = 0; i < (int)(sizeof(builtins) / sizeof(builtins[0])); i++) {
         if (starts_with(builtins[i], prefix)) count = add_match_unique(matches, count, builtins[i]);
@@ -1302,31 +1379,22 @@ static void show_matches(const char *prompt_tmpl, const char *line, int len, cha
 static int wait_for_pid_status(int pid, int *status) {
     while (1) {
         int child_status = 0;
-
         int rc = sys_waitpid(pid, &child_status, 1);
-
         if (rc == pid) {
             if (status) *status = child_status;
             return 0;
         }
-
         if (rc < 0) return -1;
-
-        int fg = -1;
-        if (ioctl(0, 0x540F /* TIOCGPGRP */, &fg) == 0 && fg > 0) {
-            if (fg != pid) return -1;
-        }
-
         usleep(10 * 1000);
     }
 }
 
 static int wait_for_pid(int pid) {
     int status = 0;
-
-    if (wait_for_pid_status(pid, &status) != 0)
-        return -1;
-
+    while (1) {
+        int r = sys_waitpid(pid, &status, 0);
+        if (r == pid || r < 0) break;
+    }
     return status;
 }
 
@@ -1365,22 +1433,113 @@ static void builtin_time_usage(void) {
 // before and after running the command, then calculating the difference.
 static unsigned long long read_uptime_ms(void) {
     char buf[64];
-    int fd;
-    int bytes;
-    int seconds;
-
-    fd = sys_open("/proc/uptime", "r");
+    int fd = open("/proc/uptime", O_RDONLY);
     if (fd < 0) return 0;
-
-    bytes = sys_read(fd, buf, sizeof(buf) - 1);
-    sys_close(fd);
-
-    if (bytes <= 0) return 0;
-
-    buf[bytes] = 0;
-    seconds = atoi(buf);
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    char *p = buf;
+    while (*p == ' ' || *p == '\t') p++;
+    unsigned long seconds = 0;
+    while (*p >= '0' && *p <= '9') {
+        seconds = seconds * 10 + (*p - '0');
+        p++;
+    }
+    if (*p == '.') {
+        p++;
+        unsigned long long frac_ms = 0;
+        int digits = 0;
+        while (*p >= '0' && *p <= '9' && digits < 3) {
+            frac_ms = frac_ms * 10 + (*p - '0');
+            digits++;
+            p++;
+        }
+        while (digits < 3) {
+            frac_ms *= 10;
+            digits++;
+        }
+        return (unsigned long long)seconds * 1000ULL + frac_ms;
+    }
 
     return (unsigned long long)seconds * 1000ULL;
+}
+
+static int execute_line(const char *line);
+static bool g_loop_break = false;
+static bool g_loop_continue = false;
+
+static int builtin_eval(int argc, char *argv[]) {
+    if (argc < 2) return 0;
+    char cmd[MAX_LINE * 2];
+    cmd[0] = '\0';
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) str_append(cmd, " ", sizeof(cmd));
+        str_append(cmd, argv[i], sizeof(cmd));
+    }
+    return execute_line(cmd);
+}
+
+static int builtin_exec(int argc, char *argv[]) {
+    if (argc < 2) return 0;
+
+    char full_path[256];
+    int res = resolve_command(argv[1], full_path, sizeof(full_path));
+    if (res != 0) {
+        print_command_resolution_error("bsh", argv[1], res);
+        return (res == 1) ? 126 : 127;
+    }
+
+    if (!is_elf_file(full_path)) {
+        char interp[256] = {0};
+        char shebang_arg[256] = {0};
+        char *new_argv[MAX_ARGS];
+        int new_argc = 0;
+
+        if (read_shebang(full_path, interp, sizeof(interp), shebang_arg, sizeof(shebang_arg))) {
+            new_argv[new_argc++] = interp;
+            if (shebang_arg[0]) {
+                new_argv[new_argc++] = shebang_arg;
+            }
+            new_argv[new_argc++] = full_path;
+            for (int i = 2; i < argc; i++) {
+                if (new_argc < MAX_ARGS - 1) {
+                    new_argv[new_argc++] = argv[i];
+                }
+            }
+            new_argv[new_argc] = NULL;
+            execv(interp, new_argv);
+        } else {
+            new_argv[new_argc++] = "/bin/bsh.elf";
+            new_argv[new_argc++] = full_path;
+            for (int i = 2; i < argc; i++) {
+                if (new_argc < MAX_ARGS - 1) {
+                    new_argv[new_argc++] = argv[i];
+                }
+            }
+            new_argv[new_argc] = NULL;
+            execv("/bin/bsh.elf", new_argv);
+        }
+    } else {
+        execv(full_path, &argv[1]);
+    }
+
+    set_color(g_color_error);
+    printf("bsh: exec: %s: %s\n", argv[1], strerror(errno));
+    reset_color();
+    return 126;
+}
+
+static int builtin_break(int argc, char *argv[]) {
+    (void)argc; (void)argv;
+    g_loop_break = true;
+    return 0;
+}
+
+static int builtin_continue(int argc, char *argv[]) {
+    (void)argc; (void)argv;
+    g_loop_continue = true;
+    return 0;
 }
 
 static bool is_builtin_name(const char *name);
@@ -1389,7 +1548,7 @@ static int execute_builtin(int argc, char *argv[]);
 static int builtin_time(int argc, char *argv[]) {
     char *resolved;
     char full_path[256];
-    char args_buf[256];
+    char args_buf[512];
     char cmdline[MAX_LINE];
     unsigned long long start;
     unsigned long long end;
@@ -1439,7 +1598,7 @@ static int builtin_time(int argc, char *argv[]) {
             int fg = pid;
             ioctl(0, 0x5410 /* TIOCSPGRP */, &fg);
             if (wait_for_pid_status(pid, &ret) != 0) ret = -1;
-            fg = 0;
+            fg = getpid();
             ioctl(0, 0x5410 /* TIOCSPGRP */, &fg);
         }
 
@@ -1540,7 +1699,7 @@ static int builtin_ls(int argc, char *argv[]) {
             shell_write(entries[i].name, (int)strlen(entries[i].name));
             set_color(g_color_size);
             char size_buf[32];
-            itoa((int)entries[i].size, size_buf);
+            snprintf(size_buf, sizeof(size_buf), "%llu", (unsigned long long)entries[i].size);
             shell_write(" (", 2);
             shell_write(size_buf, (int)strlen(size_buf));
             shell_write(" bytes)\n", 8);
@@ -1583,29 +1742,179 @@ static int builtin_cat(int argc, char *argv[]) {
 static int builtin_mkdir(int argc, char *argv[]) {
     if (argc < 2) {
         set_color(g_color_error);
-        printf("Usage: mkdir <dir>\n");
+        printf("Usage: mkdir [-p] <dir>\n");
         reset_color();
         return 1;
     }
-    if (sys_mkdir(argv[1]) == 0) return 0;
-    set_color(g_color_error);
-    printf("mkdir: cannot create %s\n", argv[1]);
-    reset_color();
-    return 1;
+    bool p_flag = false;
+    int dir_idx = 1;
+    if (str_eq(argv[1], "-p")) {
+        p_flag = true;
+        dir_idx = 2;
+        if (dir_idx >= argc) return 0;
+    }
+    for (int i = dir_idx; i < argc; i++) {
+        const char *dir = argv[i];
+        if (p_flag) {
+            char tmp[256];
+            size_t len = strlen(dir);
+            if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+            memcpy(tmp, dir, len);
+            tmp[len] = '\0';
+            for (char *p = tmp + 1; *p; p++) {
+                if (*p == '/') {
+                    *p = '\0';
+                    sys_mkdir(tmp);
+                    *p = '/';
+                }
+            }
+            sys_mkdir(tmp);
+        } else {
+            if (sys_mkdir(dir) != 0) {
+                set_color(g_color_error);
+                printf("mkdir: cannot create %s\n", dir);
+                reset_color();
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 static int builtin_rm(int argc, char *argv[]) {
     if (argc < 2) {
         set_color(g_color_error);
-        printf("Usage: rm <path>\n");
+        printf("Usage: rm [-r|-rf|-f] <path>\n");
         reset_color();
         return 1;
     }
-    if (delete_recursive(argv[1]) == 0) return 0;
-    set_color(g_color_error);
-    printf("rm: cannot delete %s\n", argv[1]);
-    reset_color();
+    int path_idx = 1;
+    while (path_idx < argc && (str_eq(argv[path_idx], "-r") || str_eq(argv[path_idx], "-rf") || str_eq(argv[path_idx], "-f"))) {
+        path_idx++;
+    }
+    for (int i = path_idx; i < argc; i++) {
+        delete_recursive(argv[i]);
+    }
+    return 0;
+}
+
+static int builtin_test(int argc, char *argv[]) {
+    if (str_eq(argv[0], "[")) {
+        if (argc < 2 || !str_eq(argv[argc - 1], "]")) {
+            set_color(g_color_error);
+            printf("[: missing `]'\n");
+            reset_color();
+            return 2;
+        }
+        argc--;
+        argv[argc] = NULL;
+        argv[0] = "test";
+    }
+    if (argc <= 1) return 1;
+
+    if (str_eq(argv[1], "!")) {
+        if (argc <= 2) return 0;
+        char *sub_argv[MAX_ARGS];
+        sub_argv[0] = argv[0];
+        for (int i = 2; i < argc; i++) sub_argv[i - 1] = argv[i];
+        sub_argv[argc - 1] = NULL;
+        return (builtin_test(argc - 1, sub_argv) == 0) ? 1 : 0;
+    }
+
+    if (argc == 2) {
+        return (argv[1][0] != '\0') ? 0 : 1;
+    }
+
+    if (argc == 3) {
+        const char *op = argv[1];
+        const char *arg = argv[2];
+        if (str_eq(op, "-z")) {
+            return (arg[0] == '\0') ? 0 : 1;
+        }
+        if (str_eq(op, "-n")) {
+            return (arg[0] != '\0') ? 0 : 1;
+        }
+        if (str_eq(op, "-e")) {
+            struct stat st;
+            return (stat(arg, &st) == 0) ? 0 : 1;
+        }
+        if (str_eq(op, "-f")) {
+            struct stat st;
+            if (stat(arg, &st) == 0 && S_ISREG(st.st_mode)) return 0;
+            return 1;
+        }
+        if (str_eq(op, "-d")) {
+            struct stat st;
+            if (stat(arg, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
+            return 1;
+        }
+        if (str_eq(op, "-s")) {
+            struct stat st;
+            if (stat(arg, &st) == 0 && st.st_size > 0) return 0;
+            return 1;
+        }
+        if (str_eq(op, "-r")) {
+            return (access(arg, R_OK) == 0) ? 0 : 1;
+        }
+        if (str_eq(op, "-w")) {
+            return (access(arg, W_OK) == 0) ? 0 : 1;
+        }
+        if (str_eq(op, "-x")) {
+            return (access(arg, X_OK) == 0) ? 0 : 1;
+        }
+    }
+
+    if (argc == 4) {
+        const char *left = argv[1];
+        const char *op = argv[2];
+        const char *right = argv[3];
+        if (str_eq(op, "=") || str_eq(op, "==")) {
+            return (str_eq(left, right)) ? 0 : 1;
+        }
+        if (str_eq(op, "!=")) {
+            return (!str_eq(left, right)) ? 0 : 1;
+        }
+        if (str_eq(op, "-eq")) {
+            return (atoi(left) == atoi(right)) ? 0 : 1;
+        }
+        if (str_eq(op, "-ne")) {
+            return (atoi(left) != atoi(right)) ? 0 : 1;
+        }
+        if (str_eq(op, "-lt")) {
+            return (atoi(left) < atoi(right)) ? 0 : 1;
+        }
+        if (str_eq(op, "-gt")) {
+            return (atoi(left) > atoi(right)) ? 0 : 1;
+        }
+        if (str_eq(op, "-le")) {
+            return (atoi(left) <= atoi(right)) ? 0 : 1;
+        }
+        if (str_eq(op, "-ge")) {
+            return (atoi(left) >= atoi(right)) ? 0 : 1;
+        }
+    }
+
     return 1;
+}
+
+static int builtin_read(int argc, char *argv[]) {
+    if (argc < 2) {
+        set_color(g_color_error);
+        printf("bsh: read: variable name required\n");
+        reset_color();
+        return 1;
+    }
+    char buf[MAX_VAR_VALUE];
+    int pos = 0;
+    char ch;
+    while (sys_read(0, &ch, 1) == 1) {
+        if (ch == '\n' || ch == '\r') break;
+        if (pos < (int)sizeof(buf) - 1) buf[pos++] = ch;
+    }
+    buf[pos] = 0;
+    trim(buf);
+    var_set(argv[1], buf);
+    return 0;
 }
 
 static int builtin_touch(int argc, char *argv[]) {
@@ -1860,10 +2169,12 @@ static int builtin_export(int argc, char *argv[]) {
         char value[MAX_VAR_VALUE];
         if (parse_assignment(argv[i], name, sizeof(name), value, sizeof(value))) {
             var_set(name, value);
+            setenv(name, value, 1);
         } else {
             const char *val = var_get(argv[i]);
             if (!val) val = "";
             var_set(argv[i], val);
+            setenv(argv[i], val, 1);
         }
     }
     return 0;
@@ -1887,7 +2198,8 @@ static int execute_builtin(int argc, char *argv[]) {
     if (str_eq(argv[0], "unalias")) return builtin_unalias(argc, argv);
     if (str_eq(argv[0], "time")) return builtin_time(argc, argv);
     if (str_eq(argv[0], "export")) return builtin_export(argc, argv);
-    if (str_eq(argv[0], ".")) {
+    if (str_eq(argv[0], "test") || str_eq(argv[0], "[")) return builtin_test(argc, argv);
+    if (str_eq(argv[0], ".") || str_eq(argv[0], "source")) {
         if (argc < 2) {
             set_color(g_color_error);
             printf("Usage: . <script> [args...]\n");
@@ -1912,7 +2224,17 @@ static int execute_builtin(int argc, char *argv[]) {
         }
         return 0;
     }
-    if (str_eq(argv[0], "exit")) return 2;
+    if (str_eq(argv[0], "read")) return builtin_read(argc, argv);
+    if (str_eq(argv[0], "eval")) return builtin_eval(argc, argv);
+    if (str_eq(argv[0], "exec")) return builtin_exec(argc, argv);
+    if (str_eq(argv[0], "break")) return builtin_break(argc, argv);
+    if (str_eq(argv[0], "continue")) return builtin_continue(argc, argv);
+    if (str_eq(argv[0], "exit")) {
+        if (argc > 1) {
+            var_set_int("?", atoi(argv[1]));
+        }
+        return 2;
+    }
     return -1;
 }
 
@@ -1922,7 +2244,9 @@ static bool is_builtin_name(const char *name) {
            str_eq(name, "mkdir") || str_eq(name, "rm") || str_eq(name, "touch") ||
            str_eq(name, "cp") || str_eq(name, "mv") || str_eq(name, "man") ||
            str_eq(name, "alias") || str_eq(name, "unalias") || str_eq(name, ".") ||
-           str_eq(name, "export") || str_eq(name, "exit");
+           str_eq(name, "source") || str_eq(name, "test") || str_eq(name, "[") ||
+           str_eq(name, "export") || str_eq(name, "read") || str_eq(name, "exit") ||
+           str_eq(name, "eval") || str_eq(name, "exec") || str_eq(name, "break") || str_eq(name, "continue");
 }
 
 typedef enum {
@@ -1940,12 +2264,31 @@ typedef enum {
 
 typedef struct {
     bsh_tok_type_t type;
+    int redir_fd;
     char text[MAX_MATCH_LEN];
 } bsh_token_t;
+
+#define MAX_REDIRS 8
+
+typedef enum {
+    BSH_REDIR_FILE = 0,
+    BSH_REDIR_DUP
+} bsh_redir_kind_t;
+
+typedef struct {
+    bsh_redir_kind_t kind;
+    int dest_fd;
+    int src_fd;
+    char target[MAX_MATCH_LEN];
+    bool append;
+    bool both;
+} bsh_redir_entry_t;
 
 typedef struct {
     char *argv[MAX_ARGS];
     int argc;
+    bsh_redir_entry_t redirs[MAX_REDIRS];
+    int redir_count;
     char *redir_in;
     char *redir_out;
     bool redir_append;
@@ -1998,23 +2341,81 @@ static int tokenize_line(const char *line, bsh_token_t toks[], int max_toks) {
             return -1;
         }
 
+        toks[tcount].redir_fd = -1;
+        toks[tcount].text[0] = 0;
+
         if (line[i] == '&' && line[i + 1] == '&') {
             toks[tcount].type = TOK_ANDAND;
-            toks[tcount].text[0] = 0;
             tcount++;
             i += 2;
             continue;
         }
         if (line[i] == '|' && line[i + 1] == '|') {
             toks[tcount].type = TOK_OROR;
-            toks[tcount].text[0] = 0;
             tcount++;
             i += 2;
             continue;
         }
+
+        if (line[i] == '&' && line[i + 1] == '>') {
+            if (line[i + 2] == '>') {
+                toks[tcount].type = TOK_GTGT;
+                toks[tcount].redir_fd = -2;
+                tcount++;
+                i += 3;
+                continue;
+            } else {
+                toks[tcount].type = TOK_GT;
+                toks[tcount].redir_fd = -2;
+                tcount++;
+                i += 2;
+                continue;
+            }
+        }
+
+        if (line[i] >= '0' && line[i] <= '9') {
+            int j = i;
+            while (line[j] >= '0' && line[j] <= '9') j++;
+            if (line[j] == '>' || line[j] == '<') {
+                int rfd = 0;
+                for (int k = i; k < j; k++) {
+                    rfd = rfd * 10 + (line[k] - '0');
+                }
+                if (line[j] == '>' && line[j + 1] == '>') {
+                    toks[tcount].type = TOK_GTGT;
+                    toks[tcount].redir_fd = rfd;
+                    tcount++;
+                    i = j + 2;
+                    continue;
+                } else if (line[j] == '>') {
+                    toks[tcount].type = TOK_GT;
+                    toks[tcount].redir_fd = rfd;
+                    tcount++;
+                    i = j + 1;
+                    continue;
+                } else if (line[j] == '<') {
+                    toks[tcount].type = TOK_LT;
+                    toks[tcount].redir_fd = rfd;
+                    tcount++;
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+
+        if (line[i] == '>' && line[i + 1] == '&' && !(
+            (line[i + 2] >= '0' && line[i + 2] <= '9') || line[i + 2] == '-'
+        )) {
+            toks[tcount].type = TOK_GT;
+            toks[tcount].redir_fd = -2;
+            tcount++;
+            i += 2;
+            continue;
+        }
+
         if (line[i] == '>' && line[i + 1] == '>') {
             toks[tcount].type = TOK_GTGT;
-            toks[tcount].text[0] = 0;
+            toks[tcount].redir_fd = 1;
             tcount++;
             i += 2;
             continue;
@@ -2022,35 +2423,48 @@ static int tokenize_line(const char *line, bsh_token_t toks[], int max_toks) {
 
         if (line[i] == '|') {
             toks[tcount].type = TOK_PIPE;
-            toks[tcount].text[0] = 0;
             tcount++;
             i++;
             continue;
         }
+
+        if (line[i] == '&' && (
+            (line[i + 1] >= '0' && line[i + 1] <= '9') || line[i + 1] == '-'
+        )) {
+            toks[tcount].type = TOK_WORD;
+            int out = 0;
+            toks[tcount].text[out++] = line[i++];
+            while (line[i] && ((line[i] >= '0' && line[i] <= '9') || line[i] == '-')) {
+                if (out < MAX_MATCH_LEN - 1) toks[tcount].text[out++] = line[i];
+                i++;
+            }
+            toks[tcount].text[out] = 0;
+            tcount++;
+            continue;
+        }
+
         if (line[i] == '&') {
             toks[tcount].type = TOK_AMP;
-            toks[tcount].text[0] = 0;
             tcount++;
             i++;
             continue;
         }
         if (line[i] == ';') {
             toks[tcount].type = TOK_SEMI;
-            toks[tcount].text[0] = 0;
             tcount++;
             i++;
             continue;
         }
         if (line[i] == '<') {
             toks[tcount].type = TOK_LT;
-            toks[tcount].text[0] = 0;
+            toks[tcount].redir_fd = 0;
             tcount++;
             i++;
             continue;
         }
         if (line[i] == '>') {
             toks[tcount].type = TOK_GT;
-            toks[tcount].text[0] = 0;
+            toks[tcount].redir_fd = 1;
             tcount++;
             i++;
             continue;
@@ -2058,6 +2472,7 @@ static int tokenize_line(const char *line, bsh_token_t toks[], int max_toks) {
 
         toks[tcount].type = TOK_WORD;
         int out = 0;
+        bool had_quotes = false;
         while (line[i] && line[i] != ' ' && line[i] != '\t' && !is_op_char(line[i])) {
             if (line[i] == '\\') {
                 i++;
@@ -2068,6 +2483,7 @@ static int tokenize_line(const char *line, bsh_token_t toks[], int max_toks) {
                 continue;
             }
             if (line[i] == '\'') {
+                had_quotes = true;
                 i++;
                 while (line[i] && line[i] != '\'') {
                     if (out < MAX_MATCH_LEN - 1) toks[tcount].text[out++] = line[i];
@@ -2077,6 +2493,7 @@ static int tokenize_line(const char *line, bsh_token_t toks[], int max_toks) {
                 continue;
             }
             if (line[i] == '"') {
+                had_quotes = true;
                 i++;
                 while (line[i] && line[i] != '"') {
                     if (line[i] == '\\') {
@@ -2119,9 +2536,8 @@ static int tokenize_line(const char *line, bsh_token_t toks[], int max_toks) {
             i++;
         }
         toks[tcount].text[out] = 0;
-        if (out == 0) {
-            print_syntax_error("unexpected token");
-            return -1;
+        if (out == 0 && !had_quotes) {
+            continue;
         }
         tcount++;
     }
@@ -2134,6 +2550,7 @@ static int tokenize_line(const char *line, bsh_token_t toks[], int max_toks) {
 static bool parse_simple_command(bsh_token_t toks[], int *idx, bsh_simple_cmd_t *cmd) {
     if (!toks || !idx || !cmd) return false;
     cmd->argc = 0;
+    cmd->redir_count = 0;
     cmd->redir_in = NULL;
     cmd->redir_out = NULL;
     cmd->redir_append = false;
@@ -2141,6 +2558,15 @@ static bool parse_simple_command(bsh_token_t toks[], int *idx, bsh_simple_cmd_t 
     while (1) {
         bsh_tok_type_t t = toks[*idx].type;
         if (t == TOK_WORD) {
+            if (cmd->argc > 0 && (
+                str_eq(toks[*idx].text, "then") ||
+                str_eq(toks[*idx].text, "else") ||
+                str_eq(toks[*idx].text, "elif") ||
+                str_eq(toks[*idx].text, "fi") ||
+                str_eq(toks[*idx].text, "do") ||
+                str_eq(toks[*idx].text, "done"))) {
+                break;
+            }
             if (cmd->argc >= MAX_ARGS - 1) {
                 print_syntax_error("too many arguments");
                 return false;
@@ -2151,16 +2577,48 @@ static bool parse_simple_command(bsh_token_t toks[], int *idx, bsh_simple_cmd_t 
         }
         if (t == TOK_LT || t == TOK_GT || t == TOK_GTGT) {
             bsh_tok_type_t redir = t;
+            int rfd = toks[*idx].redir_fd;
             (*idx)++;
             if (toks[*idx].type != TOK_WORD) {
                 print_syntax_error("missing filename after redirection");
                 return false;
             }
-            if (redir == TOK_LT) {
-                cmd->redir_in = toks[*idx].text;
+            if (cmd->redir_count >= MAX_REDIRS) {
+                print_syntax_error("too many redirections");
+                return false;
+            }
+
+            bsh_redir_entry_t *entry = &cmd->redirs[cmd->redir_count++];
+            memset(entry, 0, sizeof(*entry));
+
+            const char *arg = toks[*idx].text;
+            if (arg[0] == '&' && (
+                (arg[1] >= '0' && arg[1] <= '9') || arg[1] == '-'
+            )) {
+                entry->kind = BSH_REDIR_DUP;
+                entry->dest_fd = (rfd >= 0) ? rfd : 1;
+                if (arg[1] == '-') {
+                    entry->src_fd = -1;
+                } else {
+                    int sfd = 0;
+                    for (int k = 1; arg[k] >= '0' && arg[k] <= '9'; k++) {
+                        sfd = sfd * 10 + (arg[k] - '0');
+                    }
+                    entry->src_fd = sfd;
+                }
             } else {
-                cmd->redir_out = toks[*idx].text;
-                cmd->redir_append = (redir == TOK_GTGT);
+                entry->kind = BSH_REDIR_FILE;
+                entry->dest_fd = (rfd >= 0) ? rfd : ((redir == TOK_LT) ? 0 : 1);
+                entry->both = (rfd == -2);
+                entry->append = (redir == TOK_GTGT);
+                str_copy(entry->target, arg, sizeof(entry->target));
+
+                if (entry->dest_fd == 0) {
+                    cmd->redir_in = entry->target;
+                } else if (entry->dest_fd == 1) {
+                    cmd->redir_out = entry->target;
+                    cmd->redir_append = entry->append;
+                }
             }
             (*idx)++;
             continue;
@@ -2223,6 +2681,25 @@ static int execute_argv_inner(int argc, char *argv[], int depth, bool isolated, 
         }
     }
 
+    if (background && is_builtin_name(argv[0])) {
+        char cmd_buf[MAX_LINE];
+        build_args_string(argc, argv, 0, cmd_buf, sizeof(cmd_buf));
+        char sub_args[MAX_LINE + 16];
+        snprintf(sub_args, sizeof(sub_args), "-c \"%s\"", cmd_buf);
+        uint64_t spawn_flags = SPAWN_FLAG_INHERIT_TTY | SPAWN_FLAG_BACKGROUND;
+        int pid = -1;
+        for (int attempt = 0; attempt < 5; attempt++) {
+            pid = sys_spawn("/bin/bsh.elf", sub_args, spawn_flags, 0);
+            if (pid >= 0) break;
+            usleep(10 * 1000);
+        }
+        if (pid >= 0) {
+            if (out_pid) *out_pid = pid;
+            var_set_int("!", pid);
+            return 0;
+        }
+    }
+
     int bi = -1;
     if (isolated) {
         alias_t saved_aliases[MAX_ALIASES];
@@ -2272,7 +2749,7 @@ static int execute_argv_inner(int argc, char *argv[], int depth, bool isolated, 
             new_argv[new_argc] = NULL;
             return execute_argv_inner(new_argc, new_argv, depth + 1, isolated, background, want_exit, out_pid);
         } else {
-            new_argv[new_argc++] = "/bin/bsh";
+            new_argv[new_argc++] = "/bin/bsh.elf";
             new_argv[new_argc++] = full_path;
             for (int i = 1; i < argc; i++) {
                 if (new_argc < MAX_ARGS - 1) {
@@ -2284,7 +2761,7 @@ static int execute_argv_inner(int argc, char *argv[], int depth, bool isolated, 
         }
     }
 
-    char args_buf[256];
+    char args_buf[512];
     build_args_string(argc, argv, 1, args_buf, sizeof(args_buf));
 
     uint64_t spawn_flags = background
@@ -2305,12 +2782,15 @@ static int execute_argv_inner(int argc, char *argv[], int depth, bool isolated, 
     }
 
     if (out_pid) *out_pid = pid;
-    if (background) return 0;
+    if (background) {
+        var_set_int("!", pid);
+        return 0;
+    }
 
     int fg = pid;
     ioctl(0, 0x5410 /* TIOCSPGRP */, &fg);
     int status = wait_for_pid(pid);
-    fg = 0;
+    fg = getpid();
     ioctl(0, 0x5410 /* TIOCSPGRP */, &fg);
     return status;
 }
@@ -2329,20 +2809,18 @@ static int run_simple_command_with_fds(
 
     int saved_in = sys_dup(0);
     int saved_out = sys_dup(1);
+    int saved_err = sys_dup(2);
 
-    if (saved_in < 0 || saved_out < 0) {
+    if (saved_in < 0 || saved_out < 0 || saved_err < 0) {
         if (saved_in >= 0) sys_close(saved_in);
         if (saved_out >= 0) sys_close(saved_out);
+        if (saved_err >= 0) sys_close(saved_err);
         set_color(g_color_error);
         printf("bsh: redirection/pipeline is unavailable in this session\n");
         reset_color();
         return 1;
     }
 
-    int redir_in_fd = -1;
-    int redir_out_fd = -1;
-    bool in_is_kernel = false;
-    bool out_is_kernel = false;
     int rc = 0;
 
     // 1. Handle Pipe Input
@@ -2354,19 +2832,7 @@ static int run_simple_command_with_fds(
         goto done;
     }
 
-    // 2. Handle File Redirection Input (overrides pipe)
-    if (cmd->redir_in) {
-        redir_in_fd = bsh_open_file(cmd->redir_in, "r", &in_is_kernel);
-        if (redir_in_fd < 0 || sys_dup2(redir_in_fd, 0) < 0) {
-            set_color(g_color_error);
-            printf("bsh: cannot read from %s\n", cmd->redir_in);
-            reset_color();
-            rc = 1;
-            goto done;
-        }
-    }
-
-    // 3. Handle Pipe Output
+    // 2. Handle Pipe Output
     if (out_fd >= 0 && sys_dup2(out_fd, 1) < 0) {
         set_color(g_color_error);
         printf("bsh: failed to set pipeline output\n");
@@ -2375,29 +2841,85 @@ static int run_simple_command_with_fds(
         goto done;
     }
 
-    // 4. Handle File Redirection Output (overrides pipe)
-    if (cmd->redir_out) {
-        const char *mode = cmd->redir_append ? "a" : "w";
-        redir_out_fd = bsh_open_file(cmd->redir_out, mode, &out_is_kernel);
-        if (redir_out_fd < 0 || sys_dup2(redir_out_fd, 1) < 0) {
-            set_color(g_color_error);
-            printf("bsh: cannot write to %s\n", cmd->redir_out);
-            reset_color();
-            rc = 1;
-            goto done;
+    // 3. Handle File & FD Redirections
+    for (int r = 0; r < cmd->redir_count; r++) {
+        bsh_redir_entry_t *entry = &cmd->redirs[r];
+        if (entry->kind == BSH_REDIR_DUP) {
+            if (entry->src_fd < 0) {
+                sys_close(entry->dest_fd);
+            } else {
+                if (sys_dup2(entry->src_fd, entry->dest_fd) < 0) {
+                    set_color(g_color_error);
+                    printf("bsh: failed to duplicate fd %d to %d\n", entry->src_fd, entry->dest_fd);
+                    reset_color();
+                    rc = 1;
+                    goto done;
+                }
+            }
+        } else if (entry->kind == BSH_REDIR_FILE) {
+            bool is_kernel = false;
+            const char *mode = (entry->dest_fd == 0) ? "r" : (entry->append ? "a" : "w");
+            int fd = bsh_open_file(entry->target, mode, &is_kernel);
+            if (fd < 0) {
+                set_color(g_color_error);
+                if (entry->dest_fd == 0) {
+                    printf("bsh: cannot read from %s\n", entry->target);
+                } else {
+                    printf("bsh: cannot write to %s\n", entry->target);
+                }
+                reset_color();
+                rc = 1;
+                goto done;
+            }
+
+            if (sys_dup2(fd, entry->dest_fd) < 0) {
+                set_color(g_color_error);
+                printf("bsh: failed to redirect to fd %d\n", entry->dest_fd);
+                reset_color();
+                sys_close(fd);
+                rc = 1;
+                goto done;
+            }
+
+            if (entry->both) {
+                if (sys_dup2(fd, 2) < 0) {
+                    set_color(g_color_error);
+                    printf("bsh: failed to redirect stderr\n");
+                    reset_color();
+                    sys_close(fd);
+                    rc = 1;
+                    goto done;
+                }
+            }
+
+            if (fd != entry->dest_fd && (!entry->both || fd != 2)) {
+                sys_close(fd);
+            }
         }
     }
 
     rc = execute_argv_inner(cmd->argc, cmd->argv, 0, isolate, background, want_exit, out_pid);
 
-done:
-    if (redir_in_fd >= 0) sys_close(redir_in_fd);
-    if (redir_out_fd >= 0) sys_close(redir_out_fd);
+    if (cmd->argc == 1 && str_eq(cmd->argv[0], "exec")) {
+        if (saved_in >= 0) sys_close(saved_in);
+        if (saved_out >= 0) sys_close(saved_out);
+        if (saved_err >= 0) sys_close(saved_err);
+        return rc;
+    }
 
-    sys_dup2(saved_in, 0);
-    sys_dup2(saved_out, 1);
-    sys_close(saved_in);
-    sys_close(saved_out);
+done:
+    if (saved_in >= 0) {
+        sys_dup2(saved_in, 0);
+        sys_close(saved_in);
+    }
+    if (saved_out >= 0) {
+        sys_dup2(saved_out, 1);
+        sys_close(saved_out);
+    }
+    if (saved_err >= 0) {
+        sys_dup2(saved_err, 2);
+        sys_close(saved_err);
+    }
     return rc;
 }
 
@@ -2533,6 +3055,150 @@ static int execute_conditional_range(
     return status;
 }
 
+#define MAX_IF_DEPTH 16
+
+typedef struct {
+    bool outer_executing;
+    bool satisfied;
+    bool current_branch;
+} bsh_if_frame_t;
+
+static bsh_if_frame_t g_if_stack[MAX_IF_DEPTH];
+static int g_if_depth = 0;
+
+#define MAX_LOOP_DEPTH 8
+#define MAX_LOOP_ITEMS 64
+#define MAX_LOOP_ITEM_LEN 128
+#define MAX_LOOP_BODY_LEN 8192
+
+typedef struct {
+    char var_name[64];
+    char items[MAX_LOOP_ITEMS][MAX_LOOP_ITEM_LEN];
+    int item_count;
+    char body[MAX_LOOP_BODY_LEN];
+    bool waiting_for_do;
+    bool outer_executing;
+    int nest_level;
+} bsh_loop_frame_t;
+
+static bsh_loop_frame_t g_loop_stack[MAX_LOOP_DEPTH];
+static int g_loop_depth = 0;
+
+static inline bool bsh_is_executing(void) {
+    if (g_if_depth <= 0) return true;
+    return g_if_stack[g_if_depth - 1].outer_executing && g_if_stack[g_if_depth - 1].current_branch;
+}
+
+static int execute_loop_body(const char *body) {
+    if (!body || !body[0]) return 0;
+    char *buf = strdup(body);
+    if (!buf) return 0;
+
+    int status = 0;
+    char *line = buf;
+    while (*line && !g_loop_break) {
+        char *end = line;
+        while (*end && *end != '\n' && *end != '\r') end++;
+        char saved = *end;
+        *end = 0;
+
+        trim(line);
+        if (line[0]) {
+            status = execute_line(line);
+            if (g_loop_break || g_loop_continue) break;
+            if (status == 2) break;
+        }
+
+        line = end + (saved ? 1 : 0);
+        if (saved == '\r' && *line == '\n') line++;
+    }
+
+    free(buf);
+    return status;
+}
+
+static int run_for_loop(bsh_loop_frame_t *loop) {
+    int status = 0;
+    g_loop_break = false;
+
+    for (int i = 0; i < loop->item_count; i++) {
+        var_set(loop->var_name, loop->items[i]);
+        g_loop_continue = false;
+
+        int saved_if_depth = g_if_depth;
+        status = execute_loop_body(loop->body);
+        g_if_depth = saved_if_depth;
+
+        if (g_loop_break) {
+            g_loop_break = false;
+            break;
+        }
+        if (status == 2) {
+            return 2;
+        }
+    }
+    return status;
+}
+
+static void add_loop_item_or_glob(bsh_loop_frame_t *loop, const char *item) {
+    if (!item || !item[0] || loop->item_count >= MAX_LOOP_ITEMS) return;
+
+    if (!strchr(item, '*') && !strchr(item, '?')) {
+        str_copy(loop->items[loop->item_count++], item, MAX_LOOP_ITEM_LEN);
+        return;
+    }
+
+    char dir_path[256];
+    const char *pattern = item;
+    const char *last_slash = strrchr(item, '/');
+    if (last_slash) {
+        size_t dlen = last_slash - item;
+        if (dlen == 0) {
+            str_copy(dir_path, "/", sizeof(dir_path));
+        } else {
+            if (dlen >= sizeof(dir_path)) dlen = sizeof(dir_path) - 1;
+            memcpy(dir_path, item, dlen);
+            dir_path[dlen] = '\0';
+        }
+        pattern = last_slash + 1;
+    } else {
+        str_copy(dir_path, ".", sizeof(dir_path));
+    }
+
+    DIR *d = opendir(dir_path);
+    if (!d) {
+        str_copy(loop->items[loop->item_count++], item, MAX_LOOP_ITEM_LEN);
+        return;
+    }
+
+    int matches = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.' && pattern[0] != '.') continue;
+        if (fnmatch(pattern, ent->d_name, 0) == 0) {
+            if (loop->item_count < MAX_LOOP_ITEMS) {
+                char full[512];
+                if (last_slash) {
+                    if (str_eq(dir_path, "/")) {
+                        snprintf(full, sizeof(full), "/%s", ent->d_name);
+                    } else {
+                        snprintf(full, sizeof(full), "%s/%s", dir_path, ent->d_name);
+                    }
+                } else {
+                    str_copy(full, ent->d_name, sizeof(full));
+                }
+                str_copy(loop->items[loop->item_count++], full, MAX_LOOP_ITEM_LEN);
+                matches++;
+            }
+        }
+    }
+    closedir(d);
+
+    if (matches == 0 && loop->item_count < MAX_LOOP_ITEMS) {
+        str_copy(loop->items[loop->item_count++], item, MAX_LOOP_ITEM_LEN);
+    }
+}
+
 static int execute_line(const char *line) {
     if (!line || !line[0]) return 0;
 
@@ -2541,6 +3207,83 @@ static int execute_line(const char *line) {
     trim(line_copy);
     if (!line_copy[0]) return 0;
     if (line_copy[0] == '#') return 0;
+
+    if (g_loop_depth > 0) {
+        bsh_loop_frame_t *loop = &g_loop_stack[g_loop_depth - 1];
+
+        if (loop->waiting_for_do) {
+            bsh_token_t check_toks[MAX_TOKENS];
+            int cc = tokenize_line(line_copy, check_toks, MAX_TOKENS);
+            if (cc > 0 && check_toks[0].type == TOK_WORD && str_eq(check_toks[0].text, "do")) {
+                loop->waiting_for_do = false;
+                const char *after_do = line_copy;
+                while (*after_do && *after_do != ' ' && *after_do != '\t' && *after_do != ';') after_do++;
+                while (*after_do == ' ' || *after_do == '\t' || *after_do == ';') after_do++;
+                if (*after_do) {
+                    str_append(loop->body, after_do, sizeof(loop->body));
+                    str_append(loop->body, "\n", sizeof(loop->body));
+                }
+                return 0;
+            }
+        }
+
+        bsh_token_t check_toks[MAX_TOKENS];
+        int cc = tokenize_line(line_copy, check_toks, MAX_TOKENS);
+        int done_idx = -1;
+        for (int k = 0; k < cc; k++) {
+            bool is_boundary = (k == 0 || check_toks[k - 1].type == TOK_SEMI || check_toks[k - 1].type == TOK_AMP);
+            if (is_boundary && check_toks[k].type == TOK_WORD) {
+                if (str_eq(check_toks[k].text, "for")) {
+                    loop->nest_level++;
+                } else if (str_eq(check_toks[k].text, "done")) {
+                    if (loop->nest_level > 0) {
+                        loop->nest_level--;
+                    } else {
+                        done_idx = k;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (done_idx == -1) {
+            str_append(loop->body, line_copy, sizeof(loop->body));
+            str_append(loop->body, "\n", sizeof(loop->body));
+            return 0;
+        }
+
+        if (done_idx > 0) {
+            char prefix[MAX_LINE];
+            prefix[0] = '\0';
+            for (int k = 0; k < done_idx; k++) {
+                if (k > 0 && check_toks[k].type != TOK_SEMI) str_append(prefix, " ", sizeof(prefix));
+                if (check_toks[k].type == TOK_SEMI) str_append(prefix, "; ", sizeof(prefix));
+                else str_append(prefix, check_toks[k].text, sizeof(prefix));
+            }
+            str_append(prefix, "\n", sizeof(prefix));
+            str_append(loop->body, prefix, sizeof(loop->body));
+        }
+
+        bsh_loop_frame_t finished_loop = g_loop_stack[--g_loop_depth];
+        int status = 0;
+        if (finished_loop.outer_executing) {
+            status = run_for_loop(&finished_loop);
+        }
+
+        if (done_idx + 1 < cc && check_toks[done_idx + 1].type != TOK_END) {
+            char suffix[MAX_LINE];
+            suffix[0] = '\0';
+            for (int k = done_idx + 1; k < cc; k++) {
+                if (k > done_idx + 1 && check_toks[k].type != TOK_SEMI) str_append(suffix, " ", sizeof(suffix));
+                if (check_toks[k].type == TOK_SEMI) str_append(suffix, "; ", sizeof(suffix));
+                else str_append(suffix, check_toks[k].text, sizeof(suffix));
+            }
+            if (suffix[0]) {
+                status = execute_line(suffix);
+            }
+        }
+        return status;
+    }
 
     bsh_token_t toks[MAX_TOKENS];
     int tcount = tokenize_line(line_copy, toks, MAX_TOKENS);
@@ -2553,19 +3296,215 @@ static int execute_line(const char *line) {
 
     while (toks[idx].type != TOK_END) {
         if (toks[idx].type == TOK_SEMI || toks[idx].type == TOK_AMP) {
-            print_syntax_error("unexpected separator");
-            return 1;
+            idx++;
+            continue;
+        }
+
+        if (toks[idx].type == TOK_WORD && str_eq(toks[idx].text, "if")) {
+            idx++;
+            int cond_start = idx;
+            int cond_end = idx;
+            if (!parse_conditional_end_index(toks, cond_start, &cond_end)) return 1;
+
+            bool parent_exec = bsh_is_executing();
+            bool cond_met = false;
+            if (parent_exec) {
+                bool dummy_exit = false;
+                int cond_status = execute_conditional_range(toks, cond_start, cond_end, false, &dummy_exit);
+                var_set_int("?", cond_status);
+                cond_met = (cond_status == 0);
+            }
+
+            if (g_if_depth < MAX_IF_DEPTH) {
+                g_if_stack[g_if_depth].outer_executing = parent_exec;
+                g_if_stack[g_if_depth].satisfied = parent_exec ? cond_met : true;
+                g_if_stack[g_if_depth].current_branch = parent_exec ? cond_met : false;
+                g_if_depth++;
+            }
+
+            idx = cond_end;
+            if (toks[idx].type == TOK_SEMI) idx++;
+            if (toks[idx].type == TOK_WORD && str_eq(toks[idx].text, "then")) idx++;
+            continue;
+        }
+
+        if (toks[idx].type == TOK_WORD && str_eq(toks[idx].text, "elif")) {
+            idx++;
+            int cond_start = idx;
+            int cond_end = idx;
+            if (!parse_conditional_end_index(toks, cond_start, &cond_end)) return 1;
+
+            if (g_if_depth > 0) {
+                bsh_if_frame_t *f = &g_if_stack[g_if_depth - 1];
+                if (f->outer_executing && !f->satisfied) {
+                    bool dummy_exit = false;
+                    int cond_status = execute_conditional_range(toks, cond_start, cond_end, false, &dummy_exit);
+                    var_set_int("?", cond_status);
+                    if (cond_status == 0) {
+                        f->satisfied = true;
+                        f->current_branch = true;
+                    } else {
+                        f->current_branch = false;
+                    }
+                } else {
+                    f->current_branch = false;
+                }
+            }
+
+            idx = cond_end;
+            if (toks[idx].type == TOK_SEMI) idx++;
+            if (toks[idx].type == TOK_WORD && str_eq(toks[idx].text, "then")) idx++;
+            continue;
+        }
+
+        if (toks[idx].type == TOK_WORD && str_eq(toks[idx].text, "then")) {
+            idx++;
+            continue;
+        }
+
+        if (toks[idx].type == TOK_WORD && str_eq(toks[idx].text, "else")) {
+            idx++;
+            if (g_if_depth > 0) {
+                bsh_if_frame_t *f = &g_if_stack[g_if_depth - 1];
+                if (f->outer_executing && !f->satisfied) {
+                    f->satisfied = true;
+                    f->current_branch = true;
+                } else {
+                    f->current_branch = false;
+                }
+            }
+            continue;
+        }
+
+        if (toks[idx].type == TOK_WORD && str_eq(toks[idx].text, "fi")) {
+            idx++;
+            if (g_if_depth > 0) {
+                g_if_depth--;
+            }
+            continue;
+        }
+
+        if (toks[idx].type == TOK_WORD && str_eq(toks[idx].text, "for")) {
+            idx++;
+            if (toks[idx].type != TOK_WORD || !is_valid_var_name(toks[idx].text)) {
+                print_syntax_error("expected variable name after 'for'");
+                return 1;
+            }
+            char var_name[64];
+            str_copy(var_name, toks[idx].text, sizeof(var_name));
+            idx++;
+
+            if (toks[idx].type != TOK_WORD || !str_eq(toks[idx].text, "in")) {
+                print_syntax_error("expected 'in' after variable in 'for'");
+                return 1;
+            }
+            idx++;
+
+            if (g_loop_depth >= MAX_LOOP_DEPTH) {
+                print_syntax_error("loop depth exceeded");
+                return 1;
+            }
+
+            bsh_loop_frame_t *loop = &g_loop_stack[g_loop_depth];
+            memset(loop, 0, sizeof(*loop));
+            str_copy(loop->var_name, var_name, sizeof(loop->var_name));
+            loop->outer_executing = bsh_is_executing();
+
+            while (toks[idx].type != TOK_END && toks[idx].type != TOK_SEMI &&
+                   !(toks[idx].type == TOK_WORD && str_eq(toks[idx].text, "do"))) {
+                char *item_str = toks[idx].text;
+                char *sp;
+                while ((sp = strchr(item_str, ' ')) != NULL) {
+                    *sp = '\0';
+                    if (item_str[0]) {
+                        add_loop_item_or_glob(loop, item_str);
+                    }
+                    item_str = sp + 1;
+                    while (*item_str == ' ') item_str++;
+                }
+                if (item_str[0]) {
+                    add_loop_item_or_glob(loop, item_str);
+                }
+                idx++;
+            }
+
+            if (toks[idx].type == TOK_SEMI) idx++;
+
+            if (toks[idx].type == TOK_WORD && str_eq(toks[idx].text, "do")) {
+                idx++;
+                loop->waiting_for_do = false;
+            } else {
+                loop->waiting_for_do = true;
+            }
+
+            int nest = 0;
+            int done_idx = -1;
+            for (int k = idx; k < tcount; k++) {
+                bool is_boundary = (k == idx || toks[k - 1].type == TOK_SEMI || toks[k - 1].type == TOK_AMP);
+                if (is_boundary && toks[k].type == TOK_WORD) {
+                    if (str_eq(toks[k].text, "for")) nest++;
+                    else if (str_eq(toks[k].text, "done")) {
+                        if (nest > 0) nest--;
+                        else {
+                            done_idx = k;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (done_idx != -1) {
+                char body_str[MAX_LOOP_BODY_LEN];
+                body_str[0] = '\0';
+                for (int k = idx; k < done_idx; k++) {
+                    if (k > idx && toks[k].type != TOK_SEMI) str_append(body_str, " ", sizeof(body_str));
+                    if (toks[k].type == TOK_SEMI) str_append(body_str, "; ", sizeof(body_str));
+                    else str_append(body_str, toks[k].text, sizeof(body_str));
+                }
+                str_append(body_str, "\n", sizeof(body_str));
+                str_copy(loop->body, body_str, sizeof(loop->body));
+
+                if (loop->outer_executing) {
+                    status = run_for_loop(loop);
+                }
+                idx = done_idx + 1;
+                continue;
+            }
+
+            if (!loop->waiting_for_do && toks[idx].type != TOK_END) {
+                char prefix[MAX_LINE];
+                prefix[0] = '\0';
+                for (int k = idx; k < tcount; k++) {
+                    if (k > idx && toks[k].type != TOK_SEMI) str_append(prefix, " ", sizeof(prefix));
+                    if (toks[k].type == TOK_SEMI) str_append(prefix, "; ", sizeof(prefix));
+                    else str_append(prefix, toks[k].text, sizeof(prefix));
+                }
+                str_append(prefix, "\n", sizeof(prefix));
+                str_append(loop->body, prefix, sizeof(loop->body));
+            }
+
+            g_loop_depth++;
+            return 0;
+        }
+
+        if (toks[idx].type == TOK_WORD && (str_eq(toks[idx].text, "do") || str_eq(toks[idx].text, "done"))) {
+            idx++;
+            continue;
+        }
+
+        if (g_loop_break || g_loop_continue) {
+            return status;
         }
 
         int end_idx = idx;
         if (!parse_conditional_end_index(toks, idx, &end_idx)) return 1;
 
-        bool background = false;
-        if (toks[end_idx].type == TOK_AMP) background = true;
-
-        status = execute_conditional_range(toks, idx, end_idx, background, &want_exit);
-        var_set_int("?", status);
-        if (want_exit) return 2;
+        if (bsh_is_executing()) {
+            bool background = (toks[end_idx].type == TOK_AMP);
+            status = execute_conditional_range(toks, idx, end_idx, background, &want_exit);
+            var_set_int("?", status);
+            if (want_exit) return 2;
+        }
 
         idx = end_idx;
         if (toks[idx].type == TOK_SEMI || toks[idx].type == TOK_AMP) {
@@ -2589,12 +3528,27 @@ static bool run_script(const char *path) {
     int fd = sys_open(resolved, "r");
     if (fd < 0) return false;
 
-    char buf[4096];
-    int bytes = sys_read(fd, buf, sizeof(buf) - 1);
+    int file_size = 32768;
+    struct stat st;
+    if (stat(resolved, &st) == 0 && st.st_size > 0) {
+        file_size = (int)st.st_size;
+    }
+    char *buf = (char *)malloc(file_size + 2);
+    if (!buf) {
+        sys_close(fd);
+        return false;
+    }
+
+    int bytes = sys_read(fd, buf, file_size);
     sys_close(fd);
-    if (bytes <= 0) return true;
+    if (bytes <= 0) {
+        free(buf);
+        return true;
+    }
 
     buf[bytes] = 0;
+    int saved_if_depth = g_if_depth;
+    int saved_loop_depth = g_loop_depth;
     char *line = buf;
     while (*line) {
         char *end = line;
@@ -2603,11 +3557,18 @@ static bool run_script(const char *path) {
         *end = 0;
 
         trim(line);
-        if (line[0]) execute_line(line);
+        if (line[0]) {
+            int status = execute_line(line);
+            if (status == 2) break;
+        }
 
         line = end + (saved ? 1 : 0);
         if (saved == '\r' && *line == '\n') line++;
     }
+
+    g_if_depth = saved_if_depth;
+    g_loop_depth = saved_loop_depth;
+    free(buf);
     return true;
 }
 
@@ -2891,6 +3852,7 @@ int main(int argc, char **argv) {
     char start_dir[256];
     start_dir[0] = 0;
     int script_arg_index = -1;
+    int c_arg_index = -1;
     for (int i = 1; i < argc; i++) {
         if (str_eq(argv[i], "-t") && i + 1 < argc) {
             g_tty_id = atoi(argv[i + 1]);
@@ -2898,6 +3860,9 @@ int main(int argc, char **argv) {
         } else if (str_eq(argv[i], "-d") && i + 1 < argc) {
             str_copy(start_dir, argv[i + 1], sizeof(start_dir));
             i++;
+        } else if (str_eq(argv[i], "-c") && i + 1 < argc) {
+            c_arg_index = i + 1;
+            break;
         } else {
             bool is_num = true;
             for (int j = 0; argv[i][j]; j++) {
@@ -2919,10 +3884,16 @@ int main(int argc, char **argv) {
     load_shell_colors();
     if (start_dir[0]) {
         chdir(start_dir);
-    } else if (script_arg_index < 0 && sys_exists("/root")) {
+    } else if (script_arg_index < 0 && c_arg_index < 0 && sys_exists("/root")) {
         chdir("/root");
     }
     history_load();
+
+    if (script_arg_index < 0 && c_arg_index < 0) {
+        int fg = getpid();
+        ioctl(0, TIOCSCTTY, (void *)1);
+        ioctl(0, TIOCSPGRP, &fg);
+    }
 
     if (g_cfg.boot_script[0]) {
         if (!sys_exists("/Library/AppData/org.boredos.bsh/.boot_ran")) {
@@ -2932,8 +3903,19 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (script_arg_index < 0 && g_cfg.startup[0]) {
+    if (script_arg_index < 0 && c_arg_index < 0 && g_cfg.startup[0]) {
         run_script(g_cfg.startup);
+    }
+
+    if (c_arg_index >= 0) {
+        var_set("0", c_arg_index + 1 < argc ? argv[c_arg_index + 1] : "bsh");
+        set_positional_args(argc, argv, c_arg_index + 2);
+        int res = execute_line(argv[c_arg_index]);
+        if (res == 2) {
+            const char *q = var_get("?");
+            return q ? atoi(q) : 0;
+        }
+        return res;
     }
 
     if (script_arg_index >= 0) {
@@ -2957,11 +3939,16 @@ int main(int argc, char **argv) {
                 reset_color();
                 return 1;
             }
-            return 0;
+            const char *q = var_get("?");
+            return q ? atoi(q) : 0;
         } else {
             char cmdline[MAX_LINE];
             build_args_string(argc, argv, script_arg_index, cmdline, sizeof(cmdline));
             int res = execute_line(cmdline);
+            if (res == 2) {
+                const char *q = var_get("?");
+                return q ? atoi(q) : 0;
+            }
             return res;
         }
     } else {
@@ -2989,5 +3976,6 @@ int main(int argc, char **argv) {
         if (res == 2) break;
     }
 
-    return 0;
+    const char *q = var_get("?");
+    return q ? atoi(q) : 0;
 }
