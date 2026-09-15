@@ -7,7 +7,7 @@ This repository contains the interactive terminal shell (`bsh`) and primary shel
 This repository is designed to compile **either within the main BoredOS tree OR completely standalone**.
 
 ### 1. Integrated Build (Within BoredOS)
-If built from the BoredOS root tree, the build system passes `BOREDOS_SDK` to the Makefile. It immediately compiles `bsh.elf` against the shared pre-built SDK without duplicate clones:
+If built from the BoredOS root tree, the build system passes `BOREDOS_SDK` to the Makefile. It immediately compiles `bsh` against the shared pre-built SDK without duplicate clones:
 ```bash
 make BOREDOS_SDK=/path/to/shared/sdk
 ```
@@ -17,12 +17,12 @@ If cloned completely separately in isolation, running `make` will **automaticall
 ```bash
 make
 ```
-If `build/sdk` is missing, the Makefile automatically clones the pure standard library from `https://github.com/boredos/libc.git`, compiles it, installs it to `build/sdk`, and uses it to build `bsh.elf` standalone!
+If `build/sdk` is missing, the Makefile automatically clones the pure standard library from `https://github.com/boredos/libc.git`, compiles it, installs it to `build/sdk`, and uses it to build `bsh` standalone!
 
 ## Staging Installation
 To stage the shell executable and script assets inside your BoredOS initrd root filesystem directory:
 ```bash
 make DESTDIR=/path/to/initrd/root install
 ```
-- Binary is routed to `/bin/bsh.elf`
+- Binary is routed to `/bin/bsh`
 - Script assets are routed to `/Library/bsh/`

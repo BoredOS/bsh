@@ -260,6 +260,45 @@ static void expand_path_value(const char *val, char *out, int max_len) {
     }
 }
 
+static void expand_tilde_or_home(const char *val, char *out, int max_len) {
+    if (!out || max_len <= 0) return;
+    out[0] = 0;
+    if (!val) return;
+
+    if (val[0] == '~') {
+        const char *home = getenv("HOME");
+        if (home && home[0]) {
+            if (strcmp(home, "/") == 0) {
+                snprintf(out, max_len, "%s", val + 1);
+            } else {
+                snprintf(out, max_len, "%s%s", home, val + 1);
+            }
+            return;
+        }
+    }
+    str_copy(out, val, max_len);
+}
+
+static void ensure_parent_dirs(const char *filepath) {
+    if (!filepath || !filepath[0]) return;
+    char dir[256];
+    str_copy(dir, filepath, sizeof(dir));
+    char *slash = strrchr(dir, '/');
+    if (!slash || slash == dir) return;
+    *slash = '\0';
+
+    char current[256] = "";
+    char *saveptr = NULL;
+    char *part = strtok_r(dir + 1, "/", &saveptr);
+    while (part) {
+        char next[256];
+        snprintf(next, sizeof(next), "%s/%s", current, part);
+        str_copy(current, next, sizeof(current));
+        sys_mkdir(current);
+        part = strtok_r(NULL, "/", &saveptr);
+    }
+}
+
 static void alias_add(const char *name, const char *value) {
     if (!name || !name[0] || !value) return;
     for (int i = 0; i < g_alias_count; i++) {
@@ -553,7 +592,18 @@ static void config_defaults(void) {
     str_copy(g_cfg.prompt_left, DEFAULT_PROMPT, sizeof(g_cfg.prompt_left));
     str_copy(g_cfg.prompt_right, "", sizeof(g_cfg.prompt_right));
     str_copy(g_cfg.prompt_minimal_prefix, "> ", sizeof(g_cfg.prompt_minimal_prefix));
-    str_copy(g_cfg.history_file, "/Library/AppData/org.boredos.bsh/history", sizeof(g_cfg.history_file));
+
+    const char *env_home = getenv("HOME");
+    if (env_home && env_home[0]) {
+        if (strcmp(env_home, "/") == 0) {
+            str_copy(g_cfg.history_file, "/.bsh_history", sizeof(g_cfg.history_file));
+        } else {
+            snprintf(g_cfg.history_file, sizeof(g_cfg.history_file), "%s/Library/AppData/org.boredos.bsh/history", env_home);
+        }
+    } else {
+        str_copy(g_cfg.history_file, "/tmp/.bsh_history", sizeof(g_cfg.history_file));
+    }
+
     g_cfg.history_size = 200;
     g_cfg.prompt_minimal_history = false;
     g_cfg.glob_enabled = true;
@@ -690,9 +740,13 @@ static void render_prompt(const char *tmpl, char *out, int max_len, bool do_writ
 
             char token = tmpl[i + 1];
             if (token == '~') {
-                if (starts_with(cwd, "/root") && (cwd[5] == 0 || cwd[5] == '/')) {
+                const char *home = getenv("HOME");
+                if (!home || !home[0]) home = "/";
+                if (home[0] && strcmp(home, "/") == 0 && strcmp(cwd, "/") == 0) {
                     prompt_emit("~", 1, out, &out_idx, max_len, do_write);
-                    int j = 5;
+                } else if (home[0] && strcmp(home, "/") != 0 && starts_with(cwd, home) && (cwd[strlen(home)] == 0 || cwd[strlen(home)] == '/')) {
+                    prompt_emit("~", 1, out, &out_idx, max_len, do_write);
+                    int j = (int)strlen(home);
                     while (cwd[j]) {
                         prompt_emit(&cwd[j], 1, out, &out_idx, max_len, do_write);
                         j++;
@@ -708,8 +762,42 @@ static void render_prompt(const char *tmpl, char *out, int max_len, bool do_writ
                 continue;
             }
             if (token == 'n') {
-                const char *user = "root";
+                const char *user = getenv("USER");
+                static char pw_user[64] = "";
+                if (!user || !user[0] || strcmp(user, "user") == 0) {
+                    uid_t u = getuid();
+                    if (u == 0) {
+                        user = "root";
+                    } else {
+                        if (!pw_user[0]) {
+                            FILE *pf = fopen("/etc/passwd", "r");
+                            if (pf) {
+                                char pline[256];
+                                while (fgets(pline, sizeof(pline), pf)) {
+                                    char *nl = strchr(pline, '\n'); if (nl) *nl = 0;
+                                    char *cr = strchr(pline, '\r'); if (cr) *cr = 0;
+                                    char *ptr = pline;
+                                    char *name = strsep(&ptr, ":");
+                                    strsep(&ptr, ":");
+                                    char *uid_str = strsep(&ptr, ":");
+                                    if (uid_str && (uid_t)atol(uid_str) == u) {
+                                        strncpy(pw_user, name, sizeof(pw_user) - 1);
+                                        break;
+                                    }
+                                }
+                                fclose(pf);
+                            }
+                        }
+                        user = pw_user[0] ? pw_user : "user";
+                    }
+                }
                 prompt_emit(user, (int)strlen(user), out, &out_idx, max_len, do_write);
+                i++;
+                continue;
+            }
+            if (token == '#') {
+                const char *sym = (geteuid() == 0) ? "#" : "$";
+                prompt_emit(sym, 1, out, &out_idx, max_len, do_write);
                 i++;
                 continue;
             }
@@ -741,24 +829,7 @@ static void render_prompt(const char *tmpl, char *out, int max_len, bool do_writ
     if (do_write) reset_color();
 }
 
-static void config_load(void) {
-    config_defaults();
-
-    int fd = sys_open("/Library/AppData/org.boredos.bsh/bshrc", "r");
-    if (fd < 0) {
-        split_path(g_cfg.path);
-        return;
-    }
-
-    char buf[4096];
-    int bytes = sys_read(fd, buf, sizeof(buf) - 1);
-    sys_close(fd);
-    if (bytes <= 0) {
-        split_path(g_cfg.path);
-        return;
-    }
-    buf[bytes] = 0;
-
+static void parse_config_buffer(char *buf) {
     char *line = buf;
     while (*line) {
         char *end = line;
@@ -818,7 +889,11 @@ static void config_load(void) {
             else if (str_eq(key, "PROMPT_RIGHT")) str_copy(g_cfg.prompt_right, val, sizeof(g_cfg.prompt_right));
             else if (str_eq(key, "PROMPT_MINIMAL_HISTORY")) parse_bool(val, &g_cfg.prompt_minimal_history);
             else if (str_eq(key, "PROMPT_MINIMAL_PREFIX")) str_copy(g_cfg.prompt_minimal_prefix, val, sizeof(g_cfg.prompt_minimal_prefix));
-            else if (str_eq(key, "HISTORY_FILE")) str_copy(g_cfg.history_file, val, sizeof(g_cfg.history_file));
+            else if (str_eq(key, "HISTORY_FILE")) {
+                char exp_hist[256];
+                expand_tilde_or_home(val, exp_hist, sizeof(exp_hist));
+                str_copy(g_cfg.history_file, exp_hist, sizeof(g_cfg.history_file));
+            }
             else if (str_eq(key, "HISTORY_SIZE")) g_cfg.history_size = atoi(val);
             else if (str_eq(key, "GLOB")) parse_bool(val, &g_cfg.glob_enabled);
             else if (str_eq(key, "COMPLETE")) parse_bool(val, &g_cfg.complete_enabled);
@@ -827,6 +902,61 @@ static void config_load(void) {
 
         line = end + (saved ? 1 : 0);
         if (saved == '\r' && *line == '\n') line++;
+    }
+}
+
+static void config_load_file(const char *path) {
+    int fd = sys_open(path, "r");
+    if (fd < 0) return;
+
+    char buf[4096];
+    int bytes = sys_read(fd, buf, sizeof(buf) - 1);
+    sys_close(fd);
+    if (bytes <= 0) return;
+    buf[bytes] = 0;
+
+    parse_config_buffer(buf);
+}
+
+static void auto_seed_user_bshrc(const char *user_rc) {
+    const char *system_rc = "/Library/AppData/org.boredos.bsh/bshrc";
+    int sfd = sys_open(system_rc, "r");
+    if (sfd < 0) return;
+
+    ensure_parent_dirs(user_rc);
+
+    int dfd = sys_open(user_rc, "w");
+    if (dfd >= 0) {
+        char buf[1024];
+        int n;
+        while ((n = sys_read(sfd, buf, sizeof(buf))) > 0) {
+            sys_write_fs(dfd, buf, n);
+        }
+        sys_close(dfd);
+    }
+    sys_close(sfd);
+}
+
+static void config_load(void) {
+    config_defaults();
+    config_load_file("/Library/AppData/org.boredos.bsh/bshrc");
+
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        char user_rc[256];
+        snprintf(user_rc, sizeof(user_rc), "%s/Library/AppData/org.boredos.bsh/bshrc", home);
+        char alt_rc[256];
+        snprintf(alt_rc, sizeof(alt_rc), "%s/.bshrc", home);
+
+        if (!sys_exists(user_rc) && !sys_exists(alt_rc) && strcmp(home, "/") != 0) {
+            auto_seed_user_bshrc(user_rc);
+        }
+
+        if (sys_exists(user_rc)) {
+            config_load_file(user_rc);
+        } else if (sys_exists(alt_rc)) {
+            config_load_file(alt_rc);
+        }
     }
 
     split_path(g_cfg.path);
@@ -862,6 +992,8 @@ static void history_load(void) {
 
 static void history_save(void) {
     if (!g_cfg.history_file[0]) return;
+
+    ensure_parent_dirs(g_cfg.history_file);
 
     int fd = sys_open(g_cfg.history_file, "w");
     if (fd < 0) return;
@@ -1084,8 +1216,9 @@ static bool read_shebang(const char *path, char *interp, int interp_max, char *a
 }
 
 static int accept_command_candidate(const char *candidate) {
-    if (access(candidate, X_OK) != 0) return -1;
+    if (access(candidate, F_OK) != 0) return -1;
     if (!is_file_path(candidate)) return -2;
+    if (access(candidate, X_OK) != 0) return -3;
 
     str_copy(g_resolved_command_path, candidate, sizeof(g_resolved_command_path));
     return 0;
@@ -1149,7 +1282,7 @@ static char *resolve_command_path(const char *cmd, char *const envp[]) {
     if (!cmd || !cmd[0]) return NULL;
 
     if (str_eq(cmd, "/bin/sh") || str_eq(cmd, "/usr/bin/sh")) {
-        cmd = "/bin/bsh.elf";
+        cmd = "/bin/bsh";
     }
 
     if (contains_slash(cmd)) {
@@ -1413,7 +1546,7 @@ static void print_command_resolution_error(const char *who, const char *cmd, int
     if (res == -2) {
         printf("%s: is a directory: %s\n", who, cmd);
     } else if (res == -3) {
-        printf("%s: not executable: %s\n", who, cmd);
+        printf("%s: %s: Permission denied (try running with 'doas')\n", who, cmd);
     } else {
         printf("%s: command not found: %s\n", who, cmd);
     }
@@ -1426,7 +1559,7 @@ static void builtin_time_usage(void) {
     printf("Examples:\n");
     printf("  time ls\n");
     printf("  time hexdump file.txt\n");
-    printf("  time /bin/hexdump.elf file.txt\n");
+    printf("  time /bin/hexdump file.txt\n");
 }
 
 // Reads the system uptime in milliseconds by parsing /proc/uptime
@@ -1510,7 +1643,7 @@ static int builtin_exec(int argc, char *argv[]) {
             new_argv[new_argc] = NULL;
             execv(interp, new_argv);
         } else {
-            new_argv[new_argc++] = "/bin/bsh.elf";
+            new_argv[new_argc++] = "/bin/bsh";
             new_argv[new_argc++] = full_path;
             for (int i = 2; i < argc; i++) {
                 if (new_argc < MAX_ARGS - 1) {
@@ -1518,14 +1651,18 @@ static int builtin_exec(int argc, char *argv[]) {
                 }
             }
             new_argv[new_argc] = NULL;
-            execv("/bin/bsh.elf", new_argv);
+            execv("/bin/bsh", new_argv);
         }
     } else {
         execv(full_path, &argv[1]);
     }
 
     set_color(g_color_error);
-    printf("bsh: exec: %s: %s\n", argv[1], strerror(errno));
+    if (errno == EACCES || errno == EPERM) {
+        printf("bsh: %s: Permission denied (try running with 'doas')\n", argv[1]);
+    } else {
+        printf("bsh: exec: %s: %s\n", argv[1], strerror(errno));
+    }
     reset_color();
     return 126;
 }
@@ -1625,10 +1762,35 @@ static int builtin_time(int argc, char *argv[]) {
 }
 
 static int builtin_cd(int argc, char *argv[]) {
-    const char *path = (argc > 1) ? argv[1] : "/";
+    const char *path = NULL;
+    if (argc > 1) {
+        path = argv[1];
+    } else {
+        path = getenv("HOME");
+        if (!path || !path[0]) path = "/";
+    }
+
+    char expanded[256];
+    if (path[0] == '~') {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) home = "/";
+        if (path[1] == '/' || path[1] == '\0') {
+            if (strcmp(home, "/") == 0 && path[1] == '/') {
+                snprintf(expanded, sizeof(expanded), "%s", path + 1);
+            } else {
+                snprintf(expanded, sizeof(expanded), "%s%s", home, path + 1);
+            }
+            path = expanded;
+        }
+    }
+
     if (chdir(path) != 0) {
         set_color(g_color_error);
-        printf("cd: no such directory: %s\n", path);
+        if (errno == EACCES || errno == EPERM) {
+            printf("cd: %s: Permission denied\n", path);
+        } else {
+            printf("cd: %s: No such file or directory\n", path);
+        }
         reset_color();
         return 1;
     }
@@ -1653,10 +1815,50 @@ static int builtin_echo(int argc, char *argv[]) {
     return 0;
 }
 
+static void format_mode_string(mode_t mode, char *buf) {
+    buf[0] = S_ISDIR(mode) ? 'd' : (S_ISCHR(mode) ? 'c' : (S_ISBLK(mode) ? 'b' : (S_ISFIFO(mode) ? 'p' : (S_ISLNK(mode) ? 'l' : (S_ISSOCK(mode) ? 's' : '-')))));
+    buf[1] = (mode & S_IRUSR) ? 'r' : '-';
+    buf[2] = (mode & S_IWUSR) ? 'w' : '-';
+    buf[3] = (mode & S_IXUSR) ? 'x' : '-';
+    buf[4] = (mode & S_IRGRP) ? 'r' : '-';
+    buf[5] = (mode & S_IWGRP) ? 'w' : '-';
+    buf[6] = (mode & S_IXGRP) ? 'x' : '-';
+    buf[7] = (mode & S_IROTH) ? 'r' : '-';
+    buf[8] = (mode & S_IWOTH) ? 'w' : '-';
+    buf[9] = (mode & S_IXOTH) ? 'x' : '-';
+    buf[10] = '\0';
+}
+
 static int builtin_ls(int argc, char *argv[]) {
-    char path[256];
-    if (argc > 1) str_copy(path, argv[1], sizeof(path));
-    else if (!getcwd(path, sizeof(path))) str_copy(path, "/", sizeof(path));
+    char path[256] = "";
+    bool show_all = false;
+    bool long_format = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            const char *flag = argv[i] + 1;
+            if (strcmp(flag, "-all") == 0) {
+                show_all = true;
+                continue;
+            }
+            while (*flag) {
+                if (*flag == 'a') show_all = true;
+                else if (*flag == 'l') long_format = true;
+                flag++;
+            }
+        } else if (!path[0]) {
+            str_copy(path, argv[i], sizeof(path));
+        }
+    }
+
+    if (!path[0]) {
+        if (!getcwd(path, sizeof(path))) {
+            str_copy(path, "/", sizeof(path));
+        }
+    }
+
+    int plen = (int)strlen(path);
+    if (plen > 1 && path[plen - 1] == '/') path[plen - 1] = '\0';
 
     FAT32_FileInfo info;
     if (sys_get_file_info(path, &info) < 0) {
@@ -1688,23 +1890,90 @@ static int builtin_ls(int argc, char *argv[]) {
         return 1;
     }
 
+    if (!long_format) {
+        int col = 0;
+        for (int i = 0; i < count; i++) {
+            if (!show_all && entries[i].name[0] == '.') continue;
+            int nlen = (int)strlen(entries[i].name) + (entries[i].is_directory ? 3 : 2);
+            if (col > 0 && col + nlen > 80) {
+                printf("\n");
+                col = 0;
+            }
+            if (entries[i].is_directory) {
+                set_color(g_color_dir);
+                printf("%s/  ", entries[i].name);
+            } else {
+                set_color(g_color_file);
+                printf("%s  ", entries[i].name);
+            }
+            col += nlen;
+        }
+        if (col > 0) printf("\n");
+        reset_color();
+        free(entries);
+        return 0;
+    }
+
+    if (show_all) {
+        struct stat st_dot;
+        char mstr[11];
+        if (stat(path, &st_dot) == 0) {
+            format_mode_string(st_dot.st_mode, mstr);
+            printf("%s %8llu ", mstr, (unsigned long long)st_dot.st_size);
+        } else {
+            printf("drwxr-xr-x     4096 ");
+        }
+        set_color(g_color_dir);
+        printf("./\n");
+        reset_color();
+
+        char parent_path[256];
+        snprintf(parent_path, sizeof(parent_path), "%s/..", path);
+        if (stat(parent_path, &st_dot) == 0) {
+            format_mode_string(st_dot.st_mode, mstr);
+            printf("%s %8llu ", mstr, (unsigned long long)st_dot.st_size);
+        } else {
+            printf("drwxr-xr-x     4096 ");
+        }
+        set_color(g_color_dir);
+        printf("../\n");
+        reset_color();
+    }
+
     for (int i = 0; i < count; i++) {
+        if (!show_all && entries[i].name[0] == '.') {
+            continue;
+        }
+        if (show_all && (strcmp(entries[i].name, ".") == 0 || strcmp(entries[i].name, "..") == 0)) {
+            continue;
+        }
+
+        char full_entry[512];
+        if (strcmp(path, "/") == 0) {
+            snprintf(full_entry, sizeof(full_entry), "/%s", entries[i].name);
+        } else {
+            snprintf(full_entry, sizeof(full_entry), "%s/%s", path, entries[i].name);
+        }
+
+        struct stat st;
+        char mstr[11];
+        if (stat(full_entry, &st) == 0) {
+            format_mode_string(st.st_mode, mstr);
+            printf("%s %8llu ", mstr, (unsigned long long)st.st_size);
+        } else {
+            printf("%s %8llu ", entries[i].is_directory ? "drwxr-xr-x" : "-rw-r--r--", (unsigned long long)entries[i].size);
+        }
+
         if (entries[i].is_directory) {
             set_color(g_color_dir);
-            shell_write("[DIR]  ", 7);
-            shell_writeln(entries[i].name);
+            printf("%s/\n", entries[i].name);
         } else {
             set_color(g_color_file);
-            shell_write("[FILE] ", 7);
-            shell_write(entries[i].name, (int)strlen(entries[i].name));
-            set_color(g_color_size);
-            char size_buf[32];
-            snprintf(size_buf, sizeof(size_buf), "%llu", (unsigned long long)entries[i].size);
-            shell_write(" (", 2);
-            shell_write(size_buf, (int)strlen(size_buf));
-            shell_write(" bytes)\n", 8);
+            printf("%s\n", entries[i].name);
         }
+        reset_color();
     }
+
     reset_color();
     free(entries);
     return 0;
@@ -2474,6 +2743,93 @@ static int tokenize_line(const char *line, bsh_token_t toks[], int max_toks) {
         int out = 0;
         bool had_quotes = false;
         while (line[i] && line[i] != ' ' && line[i] != '\t' && !is_op_char(line[i])) {
+            bool is_assign = (strchr(toks[tcount].text, '=') != NULL);
+            if ((out == 0 || toks[tcount].text[out - 1] == '=' || (is_assign && toks[tcount].text[out - 1] == ':')) && line[i] == '~') {
+                int tilde_end = i + 1;
+                while (line[tilde_end] && line[tilde_end] != '/' && line[tilde_end] != ' ' &&
+                       line[tilde_end] != '\t' && line[tilde_end] != ':' && !is_op_char(line[tilde_end])) {
+                    tilde_end++;
+                }
+
+                char target_home[256] = "";
+                if (tilde_end == i + 1) {
+                    const char *home = getenv("HOME");
+                    if (home && home[0]) {
+                        strncpy(target_home, home, sizeof(target_home) - 1);
+                    } else {
+                        uid_t u = getuid();
+                        if (u == 0) {
+                            strcpy(target_home, "/");
+                        } else {
+                            FILE *pf = fopen("/etc/passwd", "r");
+                            if (pf) {
+                                char pline[256];
+                                while (fgets(pline, sizeof(pline), pf)) {
+                                    char *nl = strchr(pline, '\n'); if (nl) *nl = 0;
+                                    char *cr = strchr(pline, '\r'); if (cr) *cr = 0;
+                                    char *ptr = pline;
+                                    strsep(&ptr, ":");
+                                    strsep(&ptr, ":");
+                                    char *uid_str = strsep(&ptr, ":");
+                                    strsep(&ptr, ":");
+                                    strsep(&ptr, ":");
+                                    char *dir = strsep(&ptr, ":");
+                                    if (uid_str && (uid_t)atol(uid_str) == u && dir) {
+                                        strncpy(target_home, dir, sizeof(target_home) - 1);
+                                        break;
+                                    }
+                                }
+                                fclose(pf);
+                            }
+                            if (!target_home[0]) strcpy(target_home, "/");
+                        }
+                    }
+                } else {
+                    char uname[64];
+                    int ulen = tilde_end - (i + 1);
+                    if (ulen >= (int)sizeof(uname)) ulen = sizeof(uname) - 1;
+                    strncpy(uname, &line[i + 1], ulen);
+                    uname[ulen] = '\0';
+
+                    FILE *pf = fopen("/etc/passwd", "r");
+                    if (pf) {
+                        char pline[256];
+                        while (fgets(pline, sizeof(pline), pf)) {
+                            char *nl = strchr(pline, '\n'); if (nl) *nl = 0;
+                            char *cr = strchr(pline, '\r'); if (cr) *cr = 0;
+                            char *ptr = pline;
+                            char *pname = strsep(&ptr, ":");
+                            strsep(&ptr, ":");
+                            strsep(&ptr, ":");
+                            strsep(&ptr, ":");
+                            strsep(&ptr, ":");
+                            char *dir = strsep(&ptr, ":");
+                            if (pname && strcmp(pname, uname) == 0 && dir) {
+                                strncpy(target_home, dir, sizeof(target_home) - 1);
+                                break;
+                            }
+                        }
+                        fclose(pf);
+                    }
+                }
+
+                if (target_home[0]) {
+                    int hlen = (int)strlen(target_home);
+                    if (target_home[hlen - 1] == '/' && line[tilde_end] == '/') {
+                        if (hlen > 1) {
+                            hlen--;
+                        } else {
+                            tilde_end++;
+                        }
+                    }
+                    for (int k = 0; k < hlen && out < MAX_MATCH_LEN - 1; k++) {
+                        toks[tcount].text[out++] = target_home[k];
+                    }
+                    i = tilde_end;
+                    continue;
+                }
+            }
+
             if (line[i] == '\\') {
                 i++;
                 if (line[i]) {
@@ -2689,7 +3045,7 @@ static int execute_argv_inner(int argc, char *argv[], int depth, bool isolated, 
         uint64_t spawn_flags = SPAWN_FLAG_INHERIT_TTY | SPAWN_FLAG_BACKGROUND;
         int pid = -1;
         for (int attempt = 0; attempt < 5; attempt++) {
-            pid = sys_spawn("/bin/bsh.elf", sub_args, spawn_flags, 0);
+            pid = sys_spawn("/bin/bsh", sub_args, spawn_flags, 0);
             if (pid >= 0) break;
             usleep(10 * 1000);
         }
@@ -2749,7 +3105,7 @@ static int execute_argv_inner(int argc, char *argv[], int depth, bool isolated, 
             new_argv[new_argc] = NULL;
             return execute_argv_inner(new_argc, new_argv, depth + 1, isolated, background, want_exit, out_pid);
         } else {
-            new_argv[new_argc++] = "/bin/bsh.elf";
+            new_argv[new_argc++] = "/bin/bsh";
             new_argv[new_argc++] = full_path;
             for (int i = 1; i < argc; i++) {
                 if (new_argc < MAX_ARGS - 1) {
@@ -3880,12 +4236,52 @@ int main(int argc, char **argv) {
         }
     }
 
+    bool is_login_shell = (argv[0] && argv[0][0] == '-');
+    for (int i = 1; i < argc; i++) {
+        if (str_eq(argv[i], "-l") || str_eq(argv[i], "--login")) {
+            is_login_shell = true;
+            break;
+        }
+    }
+
     config_load();
     load_shell_colors();
+
+    uid_t my_uid = getuid();
+    FILE *pf = fopen("/etc/passwd", "r");
+    if (pf) {
+        char pline[256];
+        while (fgets(pline, sizeof(pline), pf)) {
+            char *nl = strchr(pline, '\n'); if (nl) *nl = 0;
+            char *cr = strchr(pline, '\r'); if (cr) *cr = 0;
+            char *ptr = pline;
+            char *name = strsep(&ptr, ":");
+            strsep(&ptr, ":");
+            char *uid_str = strsep(&ptr, ":");
+            strsep(&ptr, ":");
+            strsep(&ptr, ":");
+            char *dir = strsep(&ptr, ":");
+            char *shell = strsep(&ptr, ":");
+            if (uid_str && (uid_t)atol(uid_str) == my_uid) {
+                setenv("USER", name, 0);
+                setenv("LOGNAME", name, 0);
+                setenv("HOME", (dir && dir[0]) ? dir : "/", 0);
+                setenv("SHELL", (shell && shell[0]) ? shell : "/bin/bsh", 0);
+                break;
+            }
+        }
+        fclose(pf);
+    }
+
+    const char *env_home = getenv("HOME");
     if (start_dir[0]) {
         chdir(start_dir);
-    } else if (script_arg_index < 0 && c_arg_index < 0 && sys_exists("/root")) {
-        chdir("/root");
+    } else if (is_login_shell) {
+        if (env_home && sys_exists(env_home)) {
+            chdir(env_home);
+        } else {
+            chdir("/");
+        }
     }
     history_load();
 
@@ -3895,10 +4291,31 @@ int main(int argc, char **argv) {
         ioctl(0, TIOCSPGRP, &fg);
     }
 
+    if (is_login_shell && sys_exists("/etc/profile")) {
+        run_script("/etc/profile");
+    }
+
+    if (is_login_shell && env_home) {
+        char prof_path[256];
+        snprintf(prof_path, sizeof(prof_path), "%s/.profile", env_home);
+        if (sys_exists(prof_path)) run_script(prof_path);
+    }
+
+    if (script_arg_index < 0 && c_arg_index < 0 && env_home) {
+        char rc_path[256];
+        snprintf(rc_path, sizeof(rc_path), "%s/Library/AppData/org.boredos.bsh/bshrc", env_home);
+        if (sys_exists(rc_path)) {
+            run_script(rc_path);
+        } else {
+            snprintf(rc_path, sizeof(rc_path), "%s/.bshrc", env_home);
+            if (sys_exists(rc_path)) run_script(rc_path);
+        }
+    }
+
     if (g_cfg.boot_script[0]) {
-        if (!sys_exists("/Library/AppData/org.boredos.bsh/.boot_ran")) {
+        if (!sys_exists("/tmp/.bsh_boot_ran")) {
             run_script(g_cfg.boot_script);
-            int fd = sys_open("/Library/AppData/org.boredos.bsh/.boot_ran", "w");
+            int fd = sys_open("/tmp/.bsh_boot_ran", "w");
             if (fd >= 0) sys_close(fd);
         }
     }

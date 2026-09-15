@@ -17,7 +17,7 @@ BOOT_SCRIPT=/Library/AppData/org.boredos.bsh/boot.bsh
 # Tokens:
 #   %n = username
 #   %h = hostname
-#   %~ = cwd ("~" for /root)
+#   %~ = cwd ("~" for HOME)
 #   %T = time (HH:MM)
 # Colors:
 #   %{color} switches text color; use names or hex.
@@ -35,7 +35,7 @@ PROMPT_MINIMAL_HISTORY=true
 PROMPT_MINIMAL_PREFIX="> "
 
 # History settings.
-HISTORY_FILE=/Library/AppData/org.boredos.bsh/history
+HISTORY_FILE=~/Library/AppData/org.boredos.bsh/history
 HISTORY_SIZE=200
 
 # Feature toggles.
